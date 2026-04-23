@@ -51,31 +51,6 @@ var (
 	homepageBuildPattern  = regexp.MustCompile(`<html[^>]*data-build="([^"]+)"`)
 	filePointerPattern    = regexp.MustCompile(`(?:file-service://|sediment://)([A-Za-z0-9_-]+)`)
 	processStart          = time.Now()
-	navigatorKeys         = []string{
-		"webdriver−false",
-		"vendor−Google Inc.",
-		"cookieEnabled−true",
-		"pdfViewerEnabled−true",
-		"hardwareConcurrency−32",
-		"language−zh-CN",
-		"mimeTypes−[object MimeTypeArray]",
-		"userAgentData−[object NavigatorUAData]",
-	}
-	documentKeys = []string{
-		"location",
-	}
-	windowKeys = []string{
-		"innerWidth",
-		"innerHeight",
-		"devicePixelRatio",
-		"screen",
-		"chrome",
-		"location",
-		"history",
-		"navigator",
-	}
-	coreChoices = []int{16, 24, 32}
-	screenSizes = []int{3000, 4000, 6000}
 )
 
 type webSession struct {
@@ -433,6 +408,10 @@ func (w *webSession) chatRequirements(ctx context.Context, accessToken string) (
 	}
 	resp, err := w.postJSON(ctx, accessToken, "/backend-api/sentinel/chat-requirements", payload, func(req *http.Request) {
 		req.Header.Set("Accept", "*/*")
+		req.Header.Del("oai-language")
+		req.Header.Del("oai-client-build-number")
+		req.Header.Del("oai-client-version")
+		req.Header.Del("Chatgpt-Account-Id")
 	})
 	if err != nil {
 		return "", "", err
@@ -530,6 +509,9 @@ func (w *webSession) uploadImage(ctx context.Context, accessToken string, image 
 
 func (w *webSession) sendConversation(ctx context.Context, accessToken, chatToken, proofToken string, payload map[string]any) (*http.Response, error) {
 	resp, err := w.postJSON(ctx, accessToken, "/backend-api/conversation", payload, func(req *http.Request) {
+		req.Header.Set("oai-language", "zh-CN")
+		req.Header.Set("oai-client-build-number", defaultClientBuildNumber)
+		req.Header.Set("oai-client-version", defaultClientVersion)
 		req.Header.Set("Accept", "text/event-stream")
 		req.Header.Set("Accept-Language", conversationAcceptLanguage)
 		req.Header.Set("openai-sentinel-chat-requirements-token", chatToken)
@@ -553,7 +535,7 @@ func (w *webSession) pollConversationImageIDs(ctx context.Context, accessToken, 
 		if err != nil {
 			return nil, fmt.Errorf("build conversation poll request: %w", err)
 		}
-		w.applyAuthorizedHeaders(req, accessToken)
+		w.applyBearerHeaders(req, accessToken)
 		req.Header.Set("Accept", "*/*")
 
 		resp, err := w.client.Do(req)
@@ -628,7 +610,7 @@ func (w *webSession) fetchDownloadURL(ctx context.Context, accessToken, conversa
 	if err != nil {
 		return "", fmt.Errorf("build download-url request: %w", err)
 	}
-	w.applyAuthorizedHeaders(req, accessToken)
+	w.applyBearerHeaders(req, accessToken)
 
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -716,7 +698,7 @@ func (w *webSession) postJSON(ctx context.Context, accessToken, endpoint string,
 		if errBuild != nil {
 			return nil, fmt.Errorf("build request for %s: %w", endpoint, errBuild)
 		}
-		w.applyAuthorizedHeaders(req, accessToken)
+		w.applyBearerHeaders(req, accessToken)
 		req.Header.Set("Content-Type", "application/json")
 		if mutate != nil {
 			mutate(req)
@@ -824,14 +806,7 @@ func (w *webSession) applyBaseHeaders(req *http.Request) {
 }
 
 func (w *webSession) applyAuthorizedHeaders(req *http.Request, accessToken string) {
-	w.applyBaseHeaders(req)
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
-	req.Header.Set("oai-language", "zh-CN")
-	req.Header.Set("oai-client-build-number", defaultClientBuildNumber)
-	req.Header.Set("oai-client-version", defaultClientVersion)
-	if accountID := metaValue(w.auth, "account_id"); accountID != "" {
-		req.Header.Set("Chatgpt-Account-Id", accountID)
-	}
+	w.applyBearerHeaders(req, accessToken)
 }
 
 func (w *webSession) captureDeviceID(resp *http.Response) {
@@ -994,6 +969,7 @@ func canonicalFileID(fileID string) string {
 func parseHomepageMetadata(html string) ([]string, string) {
 	scriptMatches := homepageScriptPattern.FindAllStringSubmatch(html, -1)
 	scripts := make([]string, 0, len(scriptMatches))
+	dpl := ""
 	for _, match := range scriptMatches {
 		if len(match) < 2 {
 			continue
@@ -1003,16 +979,22 @@ func parseHomepageMetadata(html string) ([]string, string) {
 			continue
 		}
 		scripts = append(scripts, src)
+		if dpl == "" {
+			if submatch := proofBuildPattern.FindString(src); submatch != "" {
+				dpl = strings.TrimSpace(submatch)
+			}
+		}
 	}
 	if len(scripts) == 0 {
 		scripts = append(scripts, defaultChatGPTBaseURL+"/backend-api/sentinel/sdk.js")
 	}
 
-	dataBuild := ""
-	if match := homepageBuildPattern.FindStringSubmatch(html); len(match) >= 2 {
-		dataBuild = strings.TrimSpace(match[1])
+	if dpl == "" {
+		if match := homepageBuildPattern.FindStringSubmatch(html); len(match) >= 2 {
+			dpl = strings.TrimSpace(match[1])
+		}
 	}
-	return scripts, dataBuild
+	return scripts, dpl
 }
 
 func buildProofConfig(userAgent string, scriptSources []string, dataBuild string) []any {
@@ -1020,7 +1002,7 @@ func buildProofConfig(userAgent string, scriptSources []string, dataBuild string
 	perfMs := float64(time.Since(processStart).Milliseconds())
 
 	return []any{
-		choiceInt(screenSizes),
+		choiceInt(proofScreenSizes),
 		easternTimeString(),
 		4294705152,
 		0,
@@ -1030,13 +1012,13 @@ func buildProofConfig(userAgent string, scriptSources []string, dataBuild string
 		"en-US",
 		"en-US,es-US,en,es",
 		0,
-		choiceString(navigatorKeys),
-		choiceString(documentKeys),
-		choiceString(windowKeys),
+		choiceString(proofNavigatorKeys),
+		choiceString(proofDocumentKeys),
+		choiceString(proofWindowKeys),
 		perfMs,
 		uuid.NewString(),
 		"",
-		choiceInt(coreChoices),
+		choiceInt(proofCoreChoices),
 		nowMs - perfMs,
 	}
 }
@@ -1328,4 +1310,9 @@ func metaValue(auth *coreauth.Auth, key string) string {
 		return strings.TrimSpace(value)
 	}
 	return ""
+}
+
+func (w *webSession) applyBearerHeaders(req *http.Request, accessToken string) {
+	w.applyBaseHeaders(req)
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
 }
