@@ -24,7 +24,11 @@ func TestShouldUseCodexOAuthFallback(t *testing.T) {
 		t.Fatalf("expected api-key style codex auth to skip fallback")
 	}
 
-	if ShouldUseCodexOAuthFallback(http.StatusInternalServerError, fmt.Errorf("Tool choice 'image_generation' not found in 'tools'"), auth) {
-		t.Fatalf("expected non-400 errors to skip fallback")
+	if !ShouldUseCodexOAuthFallback(http.StatusInternalServerError, fmt.Errorf("upstream did not return image output"), auth) {
+		t.Fatalf("expected 5xx upstream image errors to trigger fallback")
+	}
+
+	if ShouldUseCodexOAuthFallback(http.StatusBadRequest, fmt.Errorf("unrelated bad request"), auth) {
+		t.Fatalf("expected unrelated 400 errors to skip fallback")
 	}
 }

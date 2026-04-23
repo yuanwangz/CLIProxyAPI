@@ -77,11 +77,26 @@ func IsMissingImageGenerationToolError(err error) bool {
 }
 
 func ShouldUseCodexOAuthFallback(statusCode int, err error, auth *coreauth.Auth) bool {
-	if statusCode != http.StatusBadRequest {
-		return false
-	}
 	if !IsCodexOAuthAuth(auth) {
 		return false
 	}
-	return IsMissingImageGenerationToolError(err)
+	if IsMissingImageGenerationToolError(err) {
+		return true
+	}
+
+	text := strings.ToLower(ErrorText(err))
+	switch statusCode {
+	case http.StatusBadGateway, http.StatusGatewayTimeout, http.StatusRequestTimeout:
+		return true
+	}
+	if statusCode >= http.StatusInternalServerError {
+		return true
+	}
+	if strings.Contains(text, "upstream did not return image output") {
+		return true
+	}
+	if strings.Contains(text, "stream disconnected before completion") {
+		return true
+	}
+	return false
 }

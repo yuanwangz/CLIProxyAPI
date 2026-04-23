@@ -13,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/imagesfallback"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -146,8 +147,18 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 
 	if errMsg != nil {
 		if h.shouldUseImageFallback(errMsg, selectedAuth.Get()) {
+			log.WithFields(log.Fields{
+				"auth_id": selectedAuth.Get(),
+				"status":  errMsg.StatusCode,
+				"error":   errorString(errMsg),
+			}).Warn("openai images: primary responses path failed, switching to codex oauth fallback")
 			fallbackOut, fallbackErr := h.executeImageFallbackAsJSON(cliCtx, selectedAuth.Get(), responseFormat, fallbackReq)
 			if fallbackErr != nil {
+				log.WithFields(log.Fields{
+					"auth_id": selectedAuth.Get(),
+					"status":  fallbackErr.StatusCode,
+					"error":   errorString(fallbackErr),
+				}).Error("openai images: codex oauth fallback failed")
 				h.WriteErrorResponse(c, fallbackErr)
 				if fallbackErr.Error != nil {
 					cliCancel(fallbackErr.Error)
@@ -224,8 +235,18 @@ func (h *OpenAIAPIHandler) streamImagesFromResponsesWithFallback(c *gin.Context,
 				continue
 			}
 			if h.shouldUseImageFallback(errMsg, selectedAuth.Get()) {
+				log.WithFields(log.Fields{
+					"auth_id": selectedAuth.Get(),
+					"status":  errMsg.StatusCode,
+					"error":   errorString(errMsg),
+				}).Warn("openai images: primary responses stream failed, switching to codex oauth fallback")
 				fallbackErr := h.writeImageFallbackStream(cliCtx, selectedAuth.Get(), responseFormat, streamPrefix, fallbackReq, setSSEHeaders, writeEvent)
 				if fallbackErr != nil {
+					log.WithFields(log.Fields{
+						"auth_id": selectedAuth.Get(),
+						"status":  fallbackErr.StatusCode,
+						"error":   errorString(fallbackErr),
+					}).Error("openai images: codex oauth stream fallback failed")
 					h.WriteErrorResponse(c, fallbackErr)
 					if fallbackErr.Error != nil {
 						cliCancel(fallbackErr.Error)
@@ -410,4 +431,11 @@ func firstNonEmptyString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func errorString(errMsg *interfaces.ErrorMessage) string {
+	if errMsg == nil || errMsg.Error == nil {
+		return ""
+	}
+	return strings.TrimSpace(errMsg.Error.Error())
 }

@@ -24,7 +24,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -33,11 +32,14 @@ const (
 	defaultChatGPTBaseURL       = "https://chatgpt.com"
 	defaultBrowserUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	defaultAcceptLanguage       = "en-US,en;q=0.9"
+	conversationAcceptLanguage  = "zh-CN,zh;q=0.9,en;q=0.8"
 	defaultSecCHUA              = `"Google Chrome";v="131", "Not.A/Brand";v="24", "Chromium";v="131"`
 	defaultSecCHUAMobile        = "?0"
 	defaultSecCHUAPlatform      = `"Windows"`
 	defaultTimezone             = "America/Los_Angeles"
 	defaultTimezoneOffsetMinute = -480
+	defaultClientBuildNumber    = "5955942"
+	defaultClientVersion        = "prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad"
 	proofAttemptLimit           = 500000
 	conversationPollInterval    = 2 * time.Second
 )
@@ -150,21 +152,17 @@ func newProxyAwareClient(ctx context.Context, cfg *sdkconfig.SDKConfig, auth *co
 	client := &http.Client{Jar: jar}
 
 	proxyURL := ""
+	var fallbackTransport http.RoundTripper
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
 	}
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
-	if proxyURL != "" {
-		transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
-		if errBuild != nil {
-			return nil, fmt.Errorf("build proxy transport: %w", errBuild)
-		}
-		client.Transport = transport
-	} else if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		client.Transport = rt
+	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil && proxyURL == "" {
+		fallbackTransport = rt
 	}
+	client.Transport = newChatGPTHTTPTransport(proxyURL, fallbackTransport)
 
 	return client, nil
 }
@@ -530,6 +528,7 @@ func (w *webSession) uploadImage(ctx context.Context, accessToken string, image 
 func (w *webSession) sendConversation(ctx context.Context, accessToken, chatToken, proofToken string, payload map[string]any) (*http.Response, error) {
 	resp, err := w.postJSON(ctx, accessToken, "/backend-api/conversation", payload, func(req *http.Request) {
 		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Accept-Language", conversationAcceptLanguage)
 		req.Header.Set("openai-sentinel-chat-requirements-token", chatToken)
 		if strings.TrimSpace(proofToken) != "" {
 			req.Header.Set("openai-sentinel-proof-token", proofToken)
@@ -751,6 +750,8 @@ func (w *webSession) applyAuthorizedHeaders(req *http.Request, accessToken strin
 	w.applyBaseHeaders(req)
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
 	req.Header.Set("oai-language", "zh-CN")
+	req.Header.Set("oai-client-build-number", defaultClientBuildNumber)
+	req.Header.Set("oai-client-version", defaultClientVersion)
 	if accountID := metaValue(w.auth, "account_id"); accountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", accountID)
 	}
