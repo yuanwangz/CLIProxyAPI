@@ -15,6 +15,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
 	"strconv"
@@ -59,7 +60,6 @@ type webSession struct {
 	auth           *coreauth.Auth
 	baseURL        string
 	deviceID       string
-	sessionID      string
 	userAgent      string
 	acceptLanguage string
 	secChUA        string
@@ -114,7 +114,6 @@ func (s *Service) newWebSession(ctx context.Context, auth *coreauth.Auth) (*webS
 		auth:           auth,
 		baseURL:        baseURL,
 		deviceID:       firstNonEmpty(authHeaderValue(auth, "oai-device-id"), metaValue(auth, "oai-device-id"), metaValue(auth, "oai_device_id"), uuid.NewString()),
-		sessionID:      firstNonEmpty(authHeaderValue(auth, "oai-session-id"), metaValue(auth, "oai-session-id"), metaValue(auth, "oai_session_id")),
 		userAgent:      firstNonEmpty(authHeaderValue(auth, "User-Agent"), metaValue(auth, "user-agent"), metaValue(auth, "user_agent"), defaultBrowserUserAgent),
 		acceptLanguage: firstNonEmpty(authHeaderValue(auth, "Accept-Language"), defaultAcceptLanguage),
 		secChUA:        firstNonEmpty(authHeaderValue(auth, "Sec-CH-UA"), metaValue(auth, "sec-ch-ua"), defaultSecCHUA),
@@ -516,6 +515,7 @@ func (w *webSession) pollConversationImageIDs(ctx context.Context, accessToken, 
 		}
 		w.applyBearerHeaders(req, accessToken)
 		req.Header.Set("Accept", "*/*")
+		applyBrowserHeaderOrder(req)
 
 		resp, err := w.client.Do(req)
 		if err != nil {
@@ -590,6 +590,7 @@ func (w *webSession) fetchDownloadURL(ctx context.Context, accessToken, conversa
 		return "", fmt.Errorf("build download-url request: %w", err)
 	}
 	w.applyBearerHeaders(req, accessToken)
+	applyBrowserHeaderOrder(req)
 
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -697,6 +698,7 @@ func (w *webSession) doRequestWithRetry(ctx context.Context, action string, buil
 			return nil, err
 		}
 
+		applyBrowserHeaderOrder(req)
 		resp, err := w.client.Do(req)
 		if !shouldRetryWebRequest(resp, err) || attempt == webRequestRetryAttempts {
 			return resp, err
@@ -767,11 +769,11 @@ func (w *webSession) applyBaseHeaders(req *http.Request) {
 		return
 	}
 	req.Header.Set("User-Agent", w.userAgent)
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Encoding", defaultAcceptEncoding)
 	req.Header.Set("Accept-Language", w.acceptLanguage)
 	req.Header.Set("Origin", w.baseURL)
 	req.Header.Set("Referer", w.baseURL+"/")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", defaultAcceptEncoding)
 	req.Header.Set("Sec-CH-UA", w.secChUA)
 	req.Header.Set("Sec-CH-UA-Mobile", w.secChUAMobile)
 	req.Header.Set("Sec-CH-UA-Platform", w.secChUAPlat)
@@ -779,17 +781,10 @@ func (w *webSession) applyBaseHeaders(req *http.Request) {
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Header.Set("oai-device-id", w.deviceID)
-	if strings.TrimSpace(w.sessionID) != "" {
-		req.Header.Set("oai-session-id", w.sessionID)
-	}
 	util.ApplyCustomHeadersFromAttrs(req, w.auth.Attributes)
 	if req.Header.Get("oai-device-id") != "" {
 		w.deviceID = strings.TrimSpace(req.Header.Get("oai-device-id"))
 	}
-	if req.Header.Get("oai-session-id") != "" {
-		w.sessionID = strings.TrimSpace(req.Header.Get("oai-session-id"))
-	}
-	applyBrowserHeaderOrder(req)
 }
 
 func (w *webSession) applyAuthorizedHeaders(req *http.Request, accessToken string) {
@@ -986,7 +981,7 @@ func parseHomepageMetadata(html string) ([]string, string) {
 
 func buildProofConfig(userAgent string, scriptSources []string, dataBuild string) []any {
 	nowMs := float64(time.Now().UnixMilli())
-	perfMs := float64(time.Since(processStart).Milliseconds())
+	perfMs := monotonicMilliseconds()
 
 	return []any{
 		choiceInt(proofScreenSizes),
@@ -1114,6 +1109,21 @@ func formatRequirementsSeed() string {
 		seed += ".0"
 	}
 	return seed
+}
+
+func monotonicMilliseconds() float64 {
+	data, err := os.ReadFile("/proc/uptime")
+	if err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) > 0 {
+			seconds, errParse := strconv.ParseFloat(fields[0], 64)
+			if errParse == nil && seconds > 0 {
+				return seconds * 1000
+			}
+		}
+	}
+
+	return float64(time.Since(processStart).Milliseconds())
 }
 
 func responseStatusError(action string, resp *http.Response) error {
@@ -1322,29 +1332,42 @@ func applyBrowserHeaderOrder(req *http.Request) {
 	if req == nil {
 		return
 	}
-	req.Header["Header-Order:"] = []string{
-		"authorization",
-		"accept",
-		"accept-encoding",
+	preferred := []string{
+		"user-agent",
 		"accept-language",
-		"content-type",
-		"oai-device-id",
-		"oai-session-id",
-		"oai-language",
-		"oai-client-build-number",
-		"oai-client-version",
-		"openai-sentinel-chat-requirements-token",
-		"openai-sentinel-proof-token",
 		"origin",
 		"referer",
+		"accept",
+		"accept-encoding",
 		"sec-ch-ua",
 		"sec-ch-ua-mobile",
 		"sec-ch-ua-platform",
 		"sec-fetch-dest",
 		"sec-fetch-mode",
 		"sec-fetch-site",
-		"user-agent",
+		"oai-device-id",
+		"authorization",
+		"content-type",
+		"oai-language",
+		"oai-client-build-number",
+		"oai-client-version",
+		"openai-sentinel-chat-requirements-token",
+		"openai-sentinel-proof-token",
 		"chatgpt-account-id",
 	}
+	order := make([]string, 0, len(preferred))
+	for _, key := range preferred {
+		if _, ok := req.Header[http.CanonicalHeaderKey(key)]; ok {
+			order = append(order, key)
+			continue
+		}
+		if _, ok := req.Header[key]; ok {
+			order = append(order, key)
+		}
+	}
+	if len(order) == 0 {
+		return
+	}
+	req.Header["Header-Order:"] = order
 	req.Header["PHeader-Order:"] = []string{":method", ":authority", ":scheme", ":path"}
 }
