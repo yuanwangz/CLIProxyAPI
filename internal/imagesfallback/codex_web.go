@@ -15,7 +15,6 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"regexp"
 	"strconv"
@@ -23,7 +22,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -34,6 +32,7 @@ const (
 	defaultBrowserUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	defaultAcceptLanguage       = "en-US,en;q=0.9"
 	defaultAcceptEncoding       = "gzip, deflate, br"
+	defaultUpgradeInsecure      = "1"
 	conversationAcceptLanguage  = "zh-CN,zh;q=0.9,en;q=0.8"
 	defaultSecCHUA              = `"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"`
 	defaultSecCHUAMobile        = "?0"
@@ -43,8 +42,8 @@ const (
 	defaultClientBuildNumber    = "5955942"
 	defaultClientVersion        = "prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad"
 	proofAttemptLimit           = 500000
-	conversationPollInterval    = 2 * time.Second
-	webRequestRetryAttempts     = 3
+	conversationPollInterval    = 3 * time.Second
+	webRequestRetryAttempts     = 4
 	webRequestRetryBackoff      = 2 * time.Second
 )
 
@@ -115,7 +114,7 @@ func (s *Service) newWebSession(ctx context.Context, auth *coreauth.Auth) (*webS
 		baseURL:        baseURL,
 		deviceID:       firstNonEmpty(authHeaderValue(auth, "oai-device-id"), metaValue(auth, "oai-device-id"), metaValue(auth, "oai_device_id"), uuid.NewString()),
 		userAgent:      firstNonEmpty(authHeaderValue(auth, "User-Agent"), metaValue(auth, "user-agent"), metaValue(auth, "user_agent"), defaultBrowserUserAgent),
-		acceptLanguage: firstNonEmpty(authHeaderValue(auth, "Accept-Language"), defaultAcceptLanguage),
+		acceptLanguage: defaultAcceptLanguage,
 		secChUA:        firstNonEmpty(authHeaderValue(auth, "Sec-CH-UA"), metaValue(auth, "sec-ch-ua"), defaultSecCHUA),
 		secChUAMobile:  firstNonEmpty(authHeaderValue(auth, "Sec-CH-UA-Mobile"), metaValue(auth, "sec-ch-ua-mobile"), defaultSecCHUAMobile),
 		secChUAPlat:    firstNonEmpty(authHeaderValue(auth, "Sec-CH-UA-Platform"), metaValue(auth, "sec-ch-ua-platform"), defaultSecCHUAPlatform),
@@ -381,8 +380,9 @@ func (w *webSession) edit(ctx context.Context, accessToken string, req Request) 
 }
 
 func (w *webSession) chatRequirements(ctx context.Context, accessToken string) (string, string, error) {
+	proofConfig := buildProofConfig(defaultBrowserUserAgent, w.scriptSources, w.dataBuild)
 	payload := map[string]any{
-		"p": buildRequirementsToken(buildProofConfig(w.userAgent, w.scriptSources, w.dataBuild)),
+		"p": buildRequirementsToken(proofConfig),
 	}
 	resp, err := w.postJSON(ctx, accessToken, "/backend-api/sentinel/chat-requirements", payload, func(req *http.Request) {
 		req.Header.Set("Accept", "*/*")
@@ -419,7 +419,7 @@ func (w *webSession) chatRequirements(ctx context.Context, accessToken string) (
 	if seed == "" || difficulty == "" {
 		return "", "", newStatusError(http.StatusBadGateway, "chat requirements proof payload is incomplete")
 	}
-	proofToken := buildProofAnswerToken(seed, difficulty, buildProofConfig(w.userAgent, w.scriptSources, w.dataBuild))
+	proofToken := buildProofAnswerToken(seed, difficulty, buildProofConfig(defaultBrowserUserAgent, w.scriptSources, w.dataBuild))
 	return token, proofToken, nil
 }
 
@@ -515,7 +515,7 @@ func (w *webSession) pollConversationImageIDs(ctx context.Context, accessToken, 
 		}
 		w.applyBearerHeaders(req, accessToken)
 		req.Header.Set("Accept", "*/*")
-		applyBrowserHeaderOrder(req)
+		applyBrowserHeaderOrder(req, browserHeaderOrderKind(req))
 
 		resp, err := w.client.Do(req)
 		if err != nil {
@@ -590,7 +590,7 @@ func (w *webSession) fetchDownloadURL(ctx context.Context, accessToken, conversa
 		return "", fmt.Errorf("build download-url request: %w", err)
 	}
 	w.applyBearerHeaders(req, accessToken)
-	applyBrowserHeaderOrder(req)
+	applyBrowserHeaderOrder(req, browserHeaderOrderKind(req))
 
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -698,7 +698,7 @@ func (w *webSession) doRequestWithRetry(ctx context.Context, action string, buil
 			return nil, err
 		}
 
-		applyBrowserHeaderOrder(req)
+		applyBrowserHeaderOrder(req, browserHeaderOrderKind(req))
 		resp, err := w.client.Do(req)
 		if !shouldRetryWebRequest(resp, err) || attempt == webRequestRetryAttempts {
 			return resp, err
@@ -773,7 +773,6 @@ func (w *webSession) applyBaseHeaders(req *http.Request) {
 	req.Header.Set("Origin", w.baseURL)
 	req.Header.Set("Referer", w.baseURL+"/")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Encoding", defaultAcceptEncoding)
 	req.Header.Set("Sec-CH-UA", w.secChUA)
 	req.Header.Set("Sec-CH-UA-Mobile", w.secChUAMobile)
 	req.Header.Set("Sec-CH-UA-Platform", w.secChUAPlat)
@@ -781,7 +780,6 @@ func (w *webSession) applyBaseHeaders(req *http.Request) {
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Header.Set("oai-device-id", w.deviceID)
-	util.ApplyCustomHeadersFromAttrs(req, w.auth.Attributes)
 	if req.Header.Get("oai-device-id") != "" {
 		w.deviceID = strings.TrimSpace(req.Header.Get("oai-device-id"))
 	}
@@ -1112,18 +1110,7 @@ func formatRequirementsSeed() string {
 }
 
 func monotonicMilliseconds() float64 {
-	data, err := os.ReadFile("/proc/uptime")
-	if err == nil {
-		fields := strings.Fields(string(data))
-		if len(fields) > 0 {
-			seconds, errParse := strconv.ParseFloat(fields[0], 64)
-			if errParse == nil && seconds > 0 {
-				return seconds * 1000
-			}
-		}
-	}
-
-	return float64(time.Since(processStart).Milliseconds())
+	return float64(time.Since(processStart).Nanoseconds()) / float64(time.Millisecond)
 }
 
 func responseStatusError(action string, resp *http.Response) error {
@@ -1289,11 +1276,11 @@ func defaultClientContextualInfo() map[string]any {
 	return map[string]any{
 		"is_dark_mode":      false,
 		"time_since_loaded": 50 + int(now%450),
-		"page_height":       700 + int(now%300),
-		"page_width":        1200 + int(now%600),
+		"page_height":       500 + int(now%500),
+		"page_width":        1000 + int(now%1000),
 		"pixel_ratio":       1.2,
-		"screen_height":     900 + int(now%300),
-		"screen_width":      1400 + int(now%800),
+		"screen_height":     800 + int(now%400),
+		"screen_width":      1200 + int(now%1000),
 	}
 }
 
@@ -1328,33 +1315,52 @@ func (w *webSession) applyBearerHeaders(req *http.Request, accessToken string) {
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
 }
 
-func applyBrowserHeaderOrder(req *http.Request) {
+type browserRequestKind int
+
+const (
+	browserRequestDefault browserRequestKind = iota
+	browserRequestBootstrap
+	browserRequestJSON
+	browserRequestConversation
+	browserRequestConversationPoll
+	browserRequestDownloadMeta
+)
+
+func browserHeaderOrderKind(req *http.Request) browserRequestKind {
+	if req == nil || req.URL == nil {
+		return browserRequestDefault
+	}
+
+	path := strings.TrimSpace(req.URL.Path)
+	switch {
+	case req.Method == http.MethodGet && path == "/":
+		return browserRequestBootstrap
+	case req.Method == http.MethodPost && path == "/backend-api/conversation":
+		return browserRequestConversation
+	case req.Method == http.MethodGet && strings.HasPrefix(path, "/backend-api/conversation/") && !strings.Contains(path, "/attachment/"):
+		return browserRequestConversationPoll
+	case req.Method == http.MethodGet && (strings.HasPrefix(path, "/backend-api/files/") || strings.Contains(path, "/attachment/")):
+		return browserRequestDownloadMeta
+	case req.Method == http.MethodPost:
+		return browserRequestJSON
+	default:
+		return browserRequestDefault
+	}
+}
+
+func applyBrowserHeaderOrder(req *http.Request, kind browserRequestKind) {
 	if req == nil {
 		return
 	}
-	preferred := []string{
-		"user-agent",
-		"accept-language",
-		"origin",
-		"referer",
-		"accept",
-		"accept-encoding",
-		"sec-ch-ua",
-		"sec-ch-ua-mobile",
-		"sec-ch-ua-platform",
-		"sec-fetch-dest",
-		"sec-fetch-mode",
-		"sec-fetch-site",
-		"oai-device-id",
-		"authorization",
-		"content-type",
-		"oai-language",
-		"oai-client-build-number",
-		"oai-client-version",
-		"openai-sentinel-chat-requirements-token",
-		"openai-sentinel-proof-token",
-		"chatgpt-account-id",
+
+	if req.Header.Get("Upgrade-Insecure-Requests") == "" {
+		req.Header.Set("Upgrade-Insecure-Requests", defaultUpgradeInsecure)
 	}
+	if req.Header.Get("Accept-Encoding") == "" {
+		req.Header.Set("Accept-Encoding", defaultAcceptEncoding)
+	}
+
+	preferred := browserHeaderOrderForKind(kind)
 	order := make([]string, 0, len(preferred))
 	for _, key := range preferred {
 		if _, ok := req.Header[http.CanonicalHeaderKey(key)]; ok {
@@ -1370,4 +1376,130 @@ func applyBrowserHeaderOrder(req *http.Request) {
 	}
 	req.Header["Header-Order:"] = order
 	req.Header["PHeader-Order:"] = []string{":method", ":authority", ":scheme", ":path"}
+}
+
+func browserHeaderOrderForKind(kind browserRequestKind) []string {
+	switch kind {
+	case browserRequestBootstrap:
+		return []string{
+			"user-agent",
+			"accept-language",
+			"origin",
+			"referer",
+			"accept",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-platform",
+			"sec-fetch-dest",
+			"sec-fetch-mode",
+			"sec-fetch-site",
+			"oai-device-id",
+			"upgrade-insecure-requests",
+			"accept-encoding",
+		}
+	case browserRequestJSON:
+		return []string{
+			"user-agent",
+			"accept-language",
+			"origin",
+			"referer",
+			"accept",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-platform",
+			"sec-fetch-dest",
+			"sec-fetch-mode",
+			"sec-fetch-site",
+			"authorization",
+			"oai-device-id",
+			"content-type",
+			"upgrade-insecure-requests",
+			"accept-encoding",
+		}
+	case browserRequestConversation:
+		return []string{
+			"user-agent",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-platform",
+			"sec-fetch-dest",
+			"sec-fetch-mode",
+			"sec-fetch-site",
+			"authorization",
+			"accept",
+			"accept-language",
+			"content-type",
+			"oai-device-id",
+			"oai-language",
+			"oai-client-build-number",
+			"oai-client-version",
+			"origin",
+			"referer",
+			"openai-sentinel-chat-requirements-token",
+			"openai-sentinel-proof-token",
+			"upgrade-insecure-requests",
+			"accept-encoding",
+		}
+	case browserRequestConversationPoll:
+		return []string{
+			"user-agent",
+			"accept-language",
+			"origin",
+			"referer",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-platform",
+			"sec-fetch-dest",
+			"sec-fetch-mode",
+			"sec-fetch-site",
+			"authorization",
+			"oai-device-id",
+			"accept",
+			"upgrade-insecure-requests",
+			"accept-encoding",
+		}
+	case browserRequestDownloadMeta:
+		return []string{
+			"user-agent",
+			"accept-language",
+			"origin",
+			"referer",
+			"accept",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-platform",
+			"sec-fetch-dest",
+			"sec-fetch-mode",
+			"sec-fetch-site",
+			"authorization",
+			"oai-device-id",
+			"upgrade-insecure-requests",
+			"accept-encoding",
+		}
+	default:
+		return []string{
+			"user-agent",
+			"accept-language",
+			"origin",
+			"referer",
+			"accept",
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-platform",
+			"sec-fetch-dest",
+			"sec-fetch-mode",
+			"sec-fetch-site",
+			"authorization",
+			"oai-device-id",
+			"content-type",
+			"oai-language",
+			"oai-client-build-number",
+			"oai-client-version",
+			"openai-sentinel-chat-requirements-token",
+			"openai-sentinel-proof-token",
+			"upgrade-insecure-requests",
+			"accept-encoding",
+			"chatgpt-account-id",
+		}
+	}
 }
