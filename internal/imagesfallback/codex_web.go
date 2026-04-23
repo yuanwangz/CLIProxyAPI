@@ -12,7 +12,6 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"path"
 	"regexp"
@@ -23,7 +22,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -32,8 +30,9 @@ const (
 	defaultChatGPTBaseURL       = "https://chatgpt.com"
 	defaultBrowserUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	defaultAcceptLanguage       = "en-US,en;q=0.9"
+	defaultAcceptEncoding       = "gzip, deflate, br"
 	conversationAcceptLanguage  = "zh-CN,zh;q=0.9,en;q=0.8"
-	defaultSecCHUA              = `"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"`
+	defaultSecCHUA              = `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`
 	defaultSecCHUAMobile        = "?0"
 	defaultSecCHUAPlatform      = `"Windows"`
 	defaultTimezone             = "America/Los_Angeles"
@@ -54,10 +53,11 @@ var (
 )
 
 type webSession struct {
-	client         *http.Client
+	client         webHTTPClient
 	auth           *coreauth.Auth
 	baseURL        string
 	deviceID       string
+	sessionID      string
 	userAgent      string
 	acceptLanguage string
 	secChUA        string
@@ -112,36 +112,13 @@ func (s *Service) newWebSession(ctx context.Context, auth *coreauth.Auth) (*webS
 		auth:           auth,
 		baseURL:        baseURL,
 		deviceID:       firstNonEmpty(authHeaderValue(auth, "oai-device-id"), metaValue(auth, "oai-device-id"), metaValue(auth, "oai_device_id"), uuid.NewString()),
+		sessionID:      firstNonEmpty(authHeaderValue(auth, "oai-session-id"), metaValue(auth, "oai-session-id"), metaValue(auth, "oai_session_id")),
 		userAgent:      firstNonEmpty(authHeaderValue(auth, "User-Agent"), metaValue(auth, "user-agent"), metaValue(auth, "user_agent"), defaultBrowserUserAgent),
 		acceptLanguage: firstNonEmpty(authHeaderValue(auth, "Accept-Language"), defaultAcceptLanguage),
 		secChUA:        firstNonEmpty(authHeaderValue(auth, "Sec-CH-UA"), metaValue(auth, "sec-ch-ua"), defaultSecCHUA),
 		secChUAMobile:  firstNonEmpty(authHeaderValue(auth, "Sec-CH-UA-Mobile"), metaValue(auth, "sec-ch-ua-mobile"), defaultSecCHUAMobile),
 		secChUAPlat:    firstNonEmpty(authHeaderValue(auth, "Sec-CH-UA-Platform"), metaValue(auth, "sec-ch-ua-platform"), defaultSecCHUAPlatform),
 	}, nil
-}
-
-func newProxyAwareClient(ctx context.Context, cfg *sdkconfig.SDKConfig, auth *coreauth.Auth) (*http.Client, error) {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, fmt.Errorf("create cookie jar: %w", err)
-	}
-
-	client := &http.Client{Jar: jar}
-
-	proxyURL := ""
-	var fallbackTransport http.RoundTripper
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil && proxyURL == "" {
-		fallbackTransport = rt
-	}
-	client.Transport = newChatGPTHTTPTransport(proxyURL, fallbackTransport)
-
-	return client, nil
 }
 
 func (w *webSession) bootstrap(ctx context.Context) error {
@@ -789,6 +766,7 @@ func (w *webSession) applyBaseHeaders(req *http.Request) {
 	}
 	req.Header.Set("User-Agent", w.userAgent)
 	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", defaultAcceptEncoding)
 	req.Header.Set("Accept-Language", w.acceptLanguage)
 	req.Header.Set("Origin", w.baseURL)
 	req.Header.Set("Referer", w.baseURL+"/")
@@ -799,10 +777,17 @@ func (w *webSession) applyBaseHeaders(req *http.Request) {
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Header.Set("oai-device-id", w.deviceID)
+	if strings.TrimSpace(w.sessionID) != "" {
+		req.Header.Set("oai-session-id", w.sessionID)
+	}
 	util.ApplyCustomHeadersFromAttrs(req, w.auth.Attributes)
 	if req.Header.Get("oai-device-id") != "" {
 		w.deviceID = strings.TrimSpace(req.Header.Get("oai-device-id"))
 	}
+	if req.Header.Get("oai-session-id") != "" {
+		w.sessionID = strings.TrimSpace(req.Header.Get("oai-session-id"))
+	}
+	applyBrowserHeaderOrder(req)
 }
 
 func (w *webSession) applyAuthorizedHeaders(req *http.Request, accessToken string) {
@@ -822,8 +807,8 @@ func (w *webSession) captureDeviceID(resp *http.Response) {
 			return
 		}
 	}
-	if resp.Request != nil && resp.Request.URL != nil && w.client != nil && w.client.Jar != nil {
-		for _, cookie := range w.client.Jar.Cookies(resp.Request.URL) {
+	if resp.Request != nil && resp.Request.URL != nil && w.client != nil {
+		for _, cookie := range w.client.Cookies(resp.Request.URL) {
 			if cookie == nil {
 				continue
 			}
@@ -1315,4 +1300,35 @@ func metaValue(auth *coreauth.Auth, key string) string {
 func (w *webSession) applyBearerHeaders(req *http.Request, accessToken string) {
 	w.applyBaseHeaders(req)
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
+}
+
+func applyBrowserHeaderOrder(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header["Header-Order:"] = []string{
+		"authorization",
+		"accept",
+		"accept-encoding",
+		"accept-language",
+		"content-type",
+		"oai-device-id",
+		"oai-session-id",
+		"oai-language",
+		"oai-client-build-number",
+		"oai-client-version",
+		"openai-sentinel-chat-requirements-token",
+		"openai-sentinel-proof-token",
+		"origin",
+		"referer",
+		"sec-ch-ua",
+		"sec-ch-ua-mobile",
+		"sec-ch-ua-platform",
+		"sec-fetch-dest",
+		"sec-fetch-mode",
+		"sec-fetch-site",
+		"user-agent",
+		"chatgpt-account-id",
+	}
+	req.Header["PHeader-Order:"] = []string{":method", ":authority", ":scheme", ":path"}
 }
