@@ -245,11 +245,7 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	}
 
 	responsesReq := buildImagesResponsesRequest(prompt, nil, tool)
-	if stream {
-		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_generation")
-		return
-	}
-	h.collectImagesFromResponses(c, responsesReq, responseFormat)
+	h.handleImageGenerationWithFallback(c, rawJSON, responsesReq, responseFormat, stream)
 }
 
 func (h *OpenAIAPIHandler) ImagesEdits(c *gin.Context) {
@@ -384,11 +380,7 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 
 	responsesReq := buildImagesResponsesRequest(prompt, images, tool)
-	if stream {
-		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_edit")
-		return
-	}
-	h.collectImagesFromResponses(c, responsesReq, responseFormat)
+	h.handleImageEditMultipartWithFallback(c, form, responsesReq, responseFormat, stream)
 }
 
 func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
@@ -490,11 +482,7 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 	}
 
 	responsesReq := buildImagesResponsesRequest(prompt, images, tool)
-	if stream {
-		h.streamImagesFromResponses(c, responsesReq, responseFormat, "image_edit")
-		return
-	}
-	h.collectImagesFromResponses(c, responsesReq, responseFormat)
+	h.handleImageEditJSONWithFallback(c, rawJSON, responsesReq, responseFormat, stream)
 }
 
 func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte) []byte {
