@@ -112,7 +112,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
-	tlsConn := tls.UClient(rawConn, tlsConfig, tls.HelloChrome_Auto)
+	tlsConn := tls.UClient(rawConn, tlsConfig, tls.HelloEdge_Auto)
 	if err = tlsConn.Handshake(); err != nil {
 		_ = rawConn.Close()
 		return nil, err

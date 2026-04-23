@@ -33,7 +33,7 @@ const (
 	defaultBrowserUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	defaultAcceptLanguage       = "en-US,en;q=0.9"
 	conversationAcceptLanguage  = "zh-CN,zh;q=0.9,en;q=0.8"
-	defaultSecCHUA              = `"Google Chrome";v="131", "Not.A/Brand";v="24", "Chromium";v="131"`
+	defaultSecCHUA              = `"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"`
 	defaultSecCHUAMobile        = "?0"
 	defaultSecCHUAPlatform      = `"Windows"`
 	defaultTimezone             = "America/Los_Angeles"
@@ -42,6 +42,8 @@ const (
 	defaultClientVersion        = "prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad"
 	proofAttemptLimit           = 500000
 	conversationPollInterval    = 2 * time.Second
+	webRequestRetryAttempts     = 3
+	webRequestRetryBackoff      = 2 * time.Second
 )
 
 var (
@@ -168,13 +170,14 @@ func newProxyAwareClient(ctx context.Context, cfg *sdkconfig.SDKConfig, auth *co
 }
 
 func (w *webSession) bootstrap(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, w.baseURL+"/", nil)
-	if err != nil {
-		return fmt.Errorf("build bootstrap request: %w", err)
-	}
-	w.applyBaseHeaders(req)
-
-	resp, err := w.client.Do(req)
+	resp, err := w.doRequestWithRetry(ctx, "bootstrap chatgpt web session", func(ctx context.Context) (*http.Request, error) {
+		req, errBuild := http.NewRequestWithContext(ctx, http.MethodGet, w.baseURL+"/", nil)
+		if errBuild != nil {
+			return nil, fmt.Errorf("build bootstrap request: %w", errBuild)
+		}
+		w.applyBaseHeaders(req)
+		return req, nil
+	})
 	if err != nil {
 		return fmt.Errorf("bootstrap chatgpt web session: %w", err)
 	}
@@ -708,20 +711,94 @@ func (w *webSession) postJSON(ctx context.Context, accessToken, endpoint string,
 	if err != nil {
 		return nil, fmt.Errorf("marshal request body for %s: %w", endpoint, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build request for %s: %w", endpoint, err)
-	}
-	w.applyAuthorizedHeaders(req, accessToken)
-	req.Header.Set("Content-Type", "application/json")
-	if mutate != nil {
-		mutate(req)
-	}
-	resp, err := w.client.Do(req)
+	resp, err := w.doRequestWithRetry(ctx, "post "+endpoint, func(ctx context.Context) (*http.Request, error) {
+		req, errBuild := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+endpoint, bytes.NewReader(body))
+		if errBuild != nil {
+			return nil, fmt.Errorf("build request for %s: %w", endpoint, errBuild)
+		}
+		w.applyAuthorizedHeaders(req, accessToken)
+		req.Header.Set("Content-Type", "application/json")
+		if mutate != nil {
+			mutate(req)
+		}
+		return req, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("post %s: %w", endpoint, err)
 	}
 	return resp, nil
+}
+
+func (w *webSession) doRequestWithRetry(ctx context.Context, action string, build func(context.Context) (*http.Request, error)) (*http.Response, error) {
+	for attempt := 1; attempt <= webRequestRetryAttempts; attempt++ {
+		req, err := build(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := w.client.Do(req)
+		if !shouldRetryWebRequest(resp, err) || attempt == webRequestRetryAttempts {
+			return resp, err
+		}
+
+		statusCode := 0
+		if resp != nil {
+			statusCode = resp.StatusCode
+			closeBody(resp.Body)
+		}
+
+		log.WithFields(log.Fields{
+			"action":  action,
+			"attempt": attempt,
+			"status":  statusCode,
+			"error":   strings.TrimSpace(errorStringValue(err)),
+		}).Warn("images fallback: retrying chatgpt web request")
+
+		if errWait := sleepWithContext(ctx, time.Duration(attempt)*webRequestRetryBackoff); errWait != nil {
+			if err != nil {
+				return nil, err
+			}
+			return resp, errWait
+		}
+	}
+
+	return nil, nil
+}
+
+func shouldRetryWebRequest(resp *http.Response, err error) bool {
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+
+	switch resp.StatusCode {
+	case http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (w *webSession) applyBaseHeaders(req *http.Request) {
@@ -1063,19 +1140,30 @@ func responseStatusError(action string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	message := strings.TrimSpace(string(body))
 	if json.Valid(body) {
-		if text := strings.TrimSpace(gjson.GetBytes(body, "error.message").String()); text != "" {
-			message = text
-		} else if text := strings.TrimSpace(gjson.GetBytes(body, "message").String()); text != "" {
-			message = text
+		for _, path := range []string{"error.message", "message", "detail.error", "detail"} {
+			if text := strings.TrimSpace(gjson.GetBytes(body, path).String()); text != "" {
+				message = text
+				break
+			}
 		}
 	}
 	if message == "" {
 		message = http.StatusText(resp.StatusCode)
 	}
+	if strings.TrimSpace(action) != "" {
+		message = fmt.Sprintf("%s failed with status %d: %s", action, resp.StatusCode, message)
+	}
 	return &statusError{
 		statusCode: resp.StatusCode,
 		message:    message,
 	}
+}
+
+func errorStringValue(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func decodeDataURL(raw string) ([]byte, string, error) {
