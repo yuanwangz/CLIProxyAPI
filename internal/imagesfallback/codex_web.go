@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha3"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"mime"
 	"net/http"
 	"net/url"
@@ -32,7 +34,7 @@ const (
 	defaultAcceptLanguage       = "en-US,en;q=0.9"
 	defaultAcceptEncoding       = "gzip, deflate, br"
 	conversationAcceptLanguage  = "zh-CN,zh;q=0.9,en;q=0.8"
-	defaultSecCHUA              = `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`
+	defaultSecCHUA              = `"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"`
 	defaultSecCHUAMobile        = "?0"
 	defaultSecCHUAPlatform      = `"Windows"`
 	defaultTimezone             = "America/Los_Angeles"
@@ -1009,7 +1011,7 @@ func buildProofConfig(userAgent string, scriptSources []string, dataBuild string
 }
 
 func buildRequirementsToken(config []any) string {
-	return "gAAAAAC" + solveProofToken(formatSeed(time.Now().UnixNano()), "0fffff", config)
+	return "gAAAAAC" + solveProofToken(formatRequirementsSeed(), "0fffff", config)
 }
 
 func buildProofAnswerToken(seed string, difficulty string, config []any) string {
@@ -1096,6 +1098,20 @@ func formatSeed(value int64) string {
 	seed = strings.TrimRight(seed, ".")
 	if seed == "" {
 		return "0"
+	}
+	return seed
+}
+
+func formatRequirementsSeed() string {
+	limit := big.NewInt(1 << 53)
+	value, err := cryptorand.Int(cryptorand.Reader, limit)
+	if err != nil {
+		return formatSeed(time.Now().UnixNano())
+	}
+
+	seed := strconv.FormatFloat(float64(value.Int64())/float64(1<<53), 'f', -1, 64)
+	if !strings.Contains(seed, ".") {
+		seed += ".0"
 	}
 	return seed
 }

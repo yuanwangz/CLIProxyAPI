@@ -10,6 +10,7 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	tls "github.com/bogdanfinn/utls"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
@@ -22,6 +23,26 @@ type webHTTPClient interface {
 
 type tlsClientAdapter struct {
 	client tlsclient.HttpClient
+}
+
+func newEdgeLikeClientProfile() profiles.ClientProfile {
+	base := profiles.Chrome_105
+	return profiles.NewClientProfile(
+		tls.HelloEdge_106,
+		base.GetSettings(),
+		base.GetSettingsOrder(),
+		base.GetPseudoHeaderOrder(),
+		base.GetConnectionFlow(),
+		base.GetPriorities(),
+		base.GetHeaderPriority(),
+		base.GetStreamID(),
+		base.GetAllowHTTP(),
+		base.GetHttp3Settings(),
+		base.GetHttp3SettingsOrder(),
+		base.GetHttp3PriorityParam(),
+		base.GetHttp3PseudoHeaderOrder(),
+		base.GetHttp3SendGreaseFrames(),
+	)
 }
 
 func newProxyAwareClient(_ context.Context, cfg *sdkconfig.SDKConfig, auth *coreauth.Auth) (webHTTPClient, error) {
@@ -40,7 +61,8 @@ func newProxyAwareClient(_ context.Context, cfg *sdkconfig.SDKConfig, auth *core
 
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutMilliseconds(0),
-		tlsclient.WithClientProfile(profiles.Chrome_131),
+		tlsclient.WithClientProfile(newEdgeLikeClientProfile()),
+		tlsclient.WithRandomTLSExtensionOrder(),
 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
 	}
 
