@@ -40,16 +40,13 @@ func (s *Service) Execute(ctx context.Context, authID string, req Request) (*Res
 	if !IsCodexOAuthAuth(auth) {
 		return nil, newStatusError(http.StatusBadRequest, "image fallback requires a Codex OAuth auth")
 	}
-	if req.Operation == OperationEdit && req.Mask != nil {
-		return nil, newStatusError(http.StatusBadRequest, "separate image masks are not supported by the Codex OAuth image fallback")
-	}
 
 	auth, err := RefreshAccessTokenIfNeeded(ctx, s.authManager, auth, false)
 	if err != nil {
 		return nil, fmt.Errorf("refresh codex oauth token: %w", err)
 	}
 
-	result, err := s.execute(ctx, auth, req)
+	result, err := s.executeWithChatGPTImage(ctx, auth, req)
 	if err == nil {
 		return result, nil
 	}
@@ -62,5 +59,5 @@ func (s *Service) Execute(ctx context.Context, authID string, req Request) (*Res
 	if errRefresh != nil {
 		return nil, fmt.Errorf("refresh codex oauth token after fallback auth failure: %w", errRefresh)
 	}
-	return s.execute(ctx, auth, req)
+	return s.executeWithChatGPTImage(ctx, auth, req)
 }
