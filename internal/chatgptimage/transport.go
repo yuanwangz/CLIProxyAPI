@@ -56,7 +56,12 @@ func (t *chromeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if cc := t.h2Conns[addr]; cc != nil {
 		if cc.CanTakeNewRequest() {
 			t.mu.Unlock()
-			return cc.RoundTrip(req)
+			resp, err := cc.RoundTrip(req)
+			if err != nil {
+				t.dropConn(addr, cc)
+				return nil, err
+			}
+			return resp, nil
 		}
 		delete(t.h2Conns, addr)
 	}
@@ -78,7 +83,12 @@ func (t *chromeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.h2Conns[addr] = cc
 	t.mu.Unlock()
 
-	return cc.RoundTrip(req)
+	resp, err := cc.RoundTrip(req)
+	if err != nil {
+		t.dropConn(addr, cc)
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (t *chromeTransport) dialTLS(ctx context.Context, addr, host string) (net.Conn, error) {
@@ -98,4 +108,20 @@ func (t *chromeTransport) dialTLS(ctx context.Context, addr, host string) (net.C
 	}
 
 	return tlsConn, nil
+}
+
+func (t *chromeTransport) dropConn(addr string, cc *http2.ClientConn) {
+	if cc == nil {
+		return
+	}
+
+	t.mu.Lock()
+	if t.h2Conns != nil && t.h2Conns[addr] == cc {
+		delete(t.h2Conns, addr)
+	}
+	t.mu.Unlock()
+
+	if err := cc.Close(); err != nil {
+		return
+	}
 }

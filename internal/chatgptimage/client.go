@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"io"
@@ -25,7 +26,8 @@ import (
 const (
 	apiBaseURL          = "https://chatgpt.com/backend-api"
 	defaultPollInterval = 3 * time.Second
-	defaultPollMaxWait  = 3 * time.Minute
+	defaultPollMaxWait  = 10 * time.Minute
+	emptyStreamPollWait = 15 * time.Second
 )
 
 type Backend struct {
@@ -94,6 +96,7 @@ type ChatGPTClient struct {
 	oaiDeviceID  string
 	userAgent    string
 	apiClient    *http.Client
+	streamClient *http.Client
 	plainClient  *http.Client
 	pollInterval time.Duration
 	pollMaxWait  time.Duration
@@ -117,6 +120,10 @@ func newChatGPTClient(auth *coreauth.Auth, cfg *sdkconfig.SDKConfig) (*ChatGPTCl
 	if err != nil {
 		return nil, fmt.Errorf("create chatgpt chrome transport: %w", err)
 	}
+	streamTransport, err := newChromeTransport(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("create chatgpt stream transport: %w", err)
+	}
 	plainTransport, err := newHTTPTransport(proxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("create plain http transport: %w", err)
@@ -128,6 +135,7 @@ func newChatGPTClient(auth *coreauth.Auth, cfg *sdkconfig.SDKConfig) (*ChatGPTCl
 		oaiDeviceID:  firstNonEmpty(metadataString(auth, "oai-device-id"), metadataString(auth, "oai_device_id"), attributeHeader(auth, "oai-device-id"), uuid.NewString()),
 		userAgent:    defaultUserAgent,
 		apiClient:    &http.Client{Transport: apiTransport},
+		streamClient: &http.Client{Transport: streamTransport},
 		plainClient:  &http.Client{Transport: plainTransport},
 		pollInterval: defaultPollInterval,
 		pollMaxWait:  defaultPollMaxWait,
@@ -150,6 +158,17 @@ func (c *ChatGPTClient) GenerateImage(ctx context.Context, prompt, model, size, 
 	}
 
 	body := c.buildConversationBody(fullPrompt, model, "", "", nil)
+	fBody := cloneConversationBody(body)
+	fBody["client_prepare_state"] = "none"
+	fBody["supported_encodings"] = []string{"v1"}
+
+	images, err := c.doFConversation(ctx, fBody)
+	if err == nil {
+		return images, nil
+	}
+	if !shouldFallbackFromFConversation(err) {
+		return nil, err
+	}
 	return c.doConversation(ctx, body)
 }
 
@@ -305,6 +324,14 @@ func (c *ChatGPTClient) DownloadImage(ctx context.Context, rawURL string) ([]byt
 }
 
 func (c *ChatGPTClient) doConversation(ctx context.Context, body map[string]any) ([]imageResult, error) {
+	return c.doConversationRequest(ctx, body, "/conversation", "conversation request")
+}
+
+func (c *ChatGPTClient) doFConversation(ctx context.Context, body map[string]any) ([]imageResult, error) {
+	return c.doConversationRequest(ctx, body, "/f/conversation", "f conversation request")
+}
+
+func (c *ChatGPTClient) doConversationRequest(ctx context.Context, body map[string]any, requestPath, action string) ([]imageResult, error) {
 	requestContext := extractConversationRequestContext(body)
 
 	chatToken, proofToken, err := c.getSentinelTokens(ctx)
@@ -317,7 +344,7 @@ func (c *ChatGPTClient) doConversation(ctx context.Context, body map[string]any)
 		return nil, fmt.Errorf("marshal conversation body: %w", err)
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, apiBaseURL+"/conversation", bytes.NewReader(jsonBody))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, apiBaseURL+requestPath, bytes.NewReader(jsonBody))
 	c.setAPIHeaders(req)
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("openai-sentinel-chat-requirements-token", chatToken)
@@ -325,13 +352,17 @@ func (c *ChatGPTClient) doConversation(ctx context.Context, body map[string]any)
 		req.Header.Set("openai-sentinel-proof-token", proofToken)
 	}
 
-	resp, err := c.apiClient.Do(req)
+	client := c.streamClient
+	if client == nil {
+		client = c.apiClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("conversation request: %w", err)
+		return nil, fmt.Errorf("%s: %w", action, err)
 	}
 	defer closeBody(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, responseStatusError("conversation request", resp)
+		return nil, responseStatusError(action, resp)
 	}
 
 	return c.parseSSE(ctx, resp.Body, requestContext)
@@ -428,17 +459,36 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 		images = append(images, c.extractImages(ctx, msg, conversationID)...)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("sse read error: %w", err)
-	}
 	if conversationID == "" {
 		conversationID = strings.TrimSpace(requestContext.ConversationID)
 	}
 	if len(images) > 0 {
 		return images, nil
 	}
+	if err := scanner.Err(); err != nil {
+		if conversationID != "" {
+			log.WithError(err).WithField("conversation_id", conversationID).Warn("chatgpt image: sse stream failed, polling conversation")
+			recovered, pollErr := c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
+			if pollErr == nil && len(recovered) > 0 {
+				return recovered, nil
+			}
+			if pollErr != nil {
+				log.WithError(pollErr).WithField("conversation_id", conversationID).Warn("chatgpt image: failed to recover after sse read error")
+			}
+		}
+		return nil, fmt.Errorf("sse read error: %w", err)
+	}
 	if asyncMode && conversationID != "" {
 		return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
+	}
+	if conversationID != "" {
+		recovered, pollErr := c.pollForImagesWithWait(ctx, conversationID, requestContext.SubmittedMessageID, minDuration(c.pollMaxWait, emptyStreamPollWait))
+		if pollErr == nil && len(recovered) > 0 {
+			return recovered, nil
+		}
+		if pollErr != nil {
+			log.WithError(pollErr).WithField("conversation_id", conversationID).Debug("chatgpt image: empty stream recovery did not produce images")
+		}
 	}
 	return nil, &statusError{statusCode: http.StatusBadGateway, message: "no images generated"}
 }
@@ -496,21 +546,26 @@ func (c *ChatGPTClient) extractImages(ctx context.Context, msg *sseMessage, conv
 }
 
 func (c *ChatGPTClient) pollForImages(ctx context.Context, conversationID, rootMessageID string) ([]imageResult, error) {
-	deadline := time.Now().Add(c.pollMaxWait)
+	return c.pollForImagesWithWait(ctx, conversationID, rootMessageID, c.pollMaxWait)
+}
+
+func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationID, rootMessageID string, maxWait time.Duration) ([]imageResult, error) {
+	if maxWait <= 0 {
+		maxWait = c.pollMaxWait
+	}
+	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
+		images, err := c.fetchConversationImages(ctx, conversationID, rootMessageID)
+		if err != nil {
+			log.WithError(err).WithField("conversation_id", conversationID).Warn("chatgpt image: poll conversation failed")
+		} else if len(images) > 0 {
+			return images, nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(c.pollInterval):
-		}
-
-		images, err := c.fetchConversationImages(ctx, conversationID, rootMessageID)
-		if err != nil {
-			log.WithError(err).WithField("conversation_id", conversationID).Warn("chatgpt image: poll conversation failed")
-			continue
-		}
-		if len(images) > 0 {
-			return images, nil
 		}
 	}
 	return nil, &statusError{statusCode: http.StatusGatewayTimeout, message: "timed out waiting for async image generation"}
@@ -928,6 +983,19 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func minDuration(values ...time.Duration) time.Duration {
+	var min time.Duration
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if min <= 0 || value < min {
+			min = value
+		}
+	}
+	return min
+}
+
 func isChatGPTHost(raw string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -1019,6 +1087,50 @@ func extractFileID(pointer string) string {
 		}
 	}
 	return ""
+}
+
+func cloneConversationBody(body map[string]any) map[string]any {
+	if len(body) == 0 {
+		return map[string]any{}
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return map[string]any{}
+	}
+	cloned := map[string]any{}
+	if err = json.Unmarshal(raw, &cloned); err != nil {
+		return map[string]any{}
+	}
+	return cloned
+}
+
+func shouldFallbackFromFConversation(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return false
+	}
+	if strings.Contains(message, "f conversation request:") {
+		return true
+	}
+	status := statusCode(err)
+	return status >= http.StatusInternalServerError &&
+		status < 600 &&
+		strings.Contains(message, "f conversation request returned")
+}
+
+func statusCode(err error) int {
+	type statusCoder interface {
+		StatusCode() int
+	}
+
+	var coded statusCoder
+	if errors.As(err, &coded) {
+		return coded.StatusCode()
+	}
+	return 0
 }
 
 type uploadedFile struct {
