@@ -470,9 +470,11 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 		if requestContext.ParentMessageID != "" && msg.ID == requestContext.ParentMessageID {
 			continue
 		}
-		if isAsyncImagePendingMessage(msg) && conversationID != "" {
-			log.WithField("conversation_id", conversationID).Debug("chatgpt image: async image placeholder received, polling conversation")
-			return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
+		if isAsyncImagePendingMessage(msg) {
+			asyncMode = true
+			if conversationID != "" {
+				log.WithField("conversation_id", conversationID).Debug("chatgpt image: async image placeholder received")
+			}
 		}
 		images = append(images, c.extractImages(ctx, msg, conversationID)...)
 	}
