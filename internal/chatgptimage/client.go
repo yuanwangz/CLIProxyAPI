@@ -596,6 +596,11 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 				}
 				pollDelay = nextConversationPollDelay(err, pollDelay)
 				if time.Since(rateLimitedSince) >= rateLimitBudget {
+					log.WithError(err).WithField("conversation_id", conversationID).Warnf(
+						"chatgpt image: conversation polling exceeded rate limit budget after %s%s",
+						rateLimitBudget,
+						lastSnapshot.suffixSummary(conversationID),
+					)
 					return nil, &statusError{
 						statusCode: http.StatusTooManyRequests,
 						message:    "chatgpt image conversation polling rate limited for too long",
@@ -605,23 +610,40 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 				log.WithError(err).WithFields(log.Fields{
 					"conversation_id": conversationID,
 					"next_delay":      pollDelay.String(),
-				}).Warn("chatgpt image: conversation poll rate limited, backing off")
+				}).Warnf(
+					"chatgpt image: conversation poll rate limited, backing off conversation_id=%q next_delay=%s%s",
+					conversationID,
+					pollDelay,
+					lastSnapshot.suffixSummary(conversationID),
+				)
 				continue
 			}
 			rateLimitedSince = time.Time{}
 			pollDelay = normalizedPollInterval(c.pollInterval)
-			log.WithError(err).WithField("conversation_id", conversationID).Warn("chatgpt image: poll conversation failed")
+			log.WithError(err).WithField("conversation_id", conversationID).Warnf(
+				"chatgpt image: poll conversation failed conversation_id=%q%s",
+				conversationID,
+				lastSnapshot.suffixSummary(conversationID),
+			)
 		} else if len(images) > 0 {
 			return images, nil
 		} else {
 			rateLimitedSince = time.Time{}
 			pollDelay = normalizedPollInterval(c.pollInterval)
 			if snapshot.Signature() != "" && snapshot.Signature() != lastSnapshot.Signature() {
-				log.WithFields(snapshot.LogFields(conversationID)).Info("chatgpt image: conversation state updated without image output")
+				log.WithFields(snapshot.LogFields(conversationID)).Infof(
+					"chatgpt image: conversation state updated without image output %s",
+					snapshot.Summary(conversationID),
+				)
 				lastSnapshot = snapshot
 			}
 		}
 	}
+	log.WithField("conversation_id", conversationID).Warnf(
+		"chatgpt image: timed out waiting for async image generation after %s%s",
+		maxWait,
+		lastSnapshot.suffixSummary(conversationID),
+	)
 	return nil, &statusError{statusCode: http.StatusGatewayTimeout, message: "timed out waiting for async image generation"}
 }
 
@@ -794,13 +816,14 @@ func (c *ChatGPTClient) buildConversationBody(prompt, model, conversationID, par
 		"messages":                             []any{msg},
 		"parent_message_id":                    parentMsgID,
 		"model":                                model,
+		"client_prepare_state":                 "success",
 		"timezone_offset_min":                  timezoneOffsetMin,
 		"timezone":                             timezoneName,
 		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
 		"enable_message_followups":             true,
 		"system_hints":                         []any{},
 		"supports_buffering":                   true,
-		"supported_encodings":                  []string{},
+		"supported_encodings":                  []string{"v1"},
 		"client_contextual_info":               defaultWebClientContext(),
 		"paragen_cot_summary_display_override": "allow",
 		"force_parallel_switch":                "auto",
@@ -1455,6 +1478,30 @@ func (s conversationPollSnapshot) Signature() string {
 		strconv.FormatBool(s.CurrentAsyncPlaceholder),
 		strconv.Itoa(s.NodeCount),
 	}, "|")
+}
+
+func (s conversationPollSnapshot) Summary(conversationID string) string {
+	return fmt.Sprintf(
+		"conversation_id=%q async_status=%d current_node=%q current_role=%q current_content_type=%q current_status=%q current_recipient=%q current_channel=%q current_has_image_pointer=%t current_async_placeholder=%t node_count=%d",
+		conversationID,
+		s.AsyncStatus,
+		s.CurrentNode,
+		s.CurrentRole,
+		s.CurrentContentType,
+		s.CurrentStatus,
+		s.CurrentRecipient,
+		s.CurrentChannel,
+		s.CurrentHasImagePointer,
+		s.CurrentAsyncPlaceholder,
+		s.NodeCount,
+	)
+}
+
+func (s conversationPollSnapshot) suffixSummary(conversationID string) string {
+	if s.Signature() == "" {
+		return ""
+	}
+	return " last_state={" + s.Summary(conversationID) + "}"
 }
 
 func (s conversationPollSnapshot) LogFields(conversationID string) log.Fields {

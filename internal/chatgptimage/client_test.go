@@ -2,6 +2,7 @@ package chatgptimage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -715,6 +716,7 @@ func TestPollForImagesStopsAfterRateLimitBudget(t *testing.T) {
 }
 
 func TestGenerateImagePrefersFConversation(t *testing.T) {
+	var requestBody map[string]any
 	client := &ChatGPTClient{
 		accessToken: "token",
 		oaiDeviceID: "device",
@@ -744,6 +746,13 @@ func TestGenerateImagePrefersFConversation(t *testing.T) {
 				if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/f/conversation") {
 					t.Fatalf("unexpected stream request: %s %s", req.Method, req.URL.String())
 				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("read request body: %v", err)
+				}
+				if err = json.Unmarshal(body, &requestBody); err != nil {
+					t.Fatalf("decode request body: %v", err)
+				}
 				stream := strings.Join([]string{
 					`data: {"conversation_id":"conv-f","message":{"id":"tool-f","author":{"role":"tool"},"status":"finished_successfully","content":{"content_type":"multimodal_text","parts":[{"content_type":"image_asset_pointer","asset_pointer":"sediment://file-f","metadata":{"dalle":{"gen_id":"gen-f","prompt":"prompt"}}}]}}}`,
 					"",
@@ -769,9 +778,17 @@ func TestGenerateImagePrefersFConversation(t *testing.T) {
 	if images[0].FileID != "file-f" {
 		t.Fatalf("expected file-f, got %s", images[0].FileID)
 	}
+	if got := stringValue(requestBody["client_prepare_state"]); got != "success" {
+		t.Fatalf("client_prepare_state = %q, want success", got)
+	}
+	gotEncodings, ok := requestBody["supported_encodings"].([]any)
+	if !ok || len(gotEncodings) != 1 || stringValue(gotEncodings[0]) != "v1" {
+		t.Fatalf("supported_encodings = %#v, want [\"v1\"]", requestBody["supported_encodings"])
+	}
 }
 
 func TestGenerateImageFallsBackToConversationWhenFConversationFails(t *testing.T) {
+	requestBodies := make(map[string]map[string]any)
 	client := &ChatGPTClient{
 		accessToken: "token",
 		oaiDeviceID: "device",
@@ -798,14 +815,24 @@ func TestGenerateImageFallsBackToConversationWhenFConversationFails(t *testing.T
 		},
 		streamClient: &http.Client{
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("read request body: %v", err)
+				}
+				decoded := make(map[string]any)
+				if err = json.Unmarshal(body, &decoded); err != nil {
+					t.Fatalf("decode request body: %v", err)
+				}
 				switch {
 				case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/f/conversation"):
+					requestBodies["/f/conversation"] = decoded
 					return &http.Response{
 						StatusCode: http.StatusInternalServerError,
 						Header:     make(http.Header),
 						Body:       io.NopCloser(strings.NewReader(`{"error":"boom"}`)),
 					}, nil
 				case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/conversation"):
+					requestBodies["/conversation"] = decoded
 					stream := strings.Join([]string{
 						`data: {"conversation_id":"conv-c","message":{"id":"tool-c","author":{"role":"tool"},"status":"finished_successfully","content":{"content_type":"multimodal_text","parts":[{"content_type":"image_asset_pointer","asset_pointer":"sediment://file-c","metadata":{"dalle":{"gen_id":"gen-c","prompt":"prompt"}}}]}}}`,
 						"",
@@ -834,6 +861,16 @@ func TestGenerateImageFallsBackToConversationWhenFConversationFails(t *testing.T
 	}
 	if images[0].FileID != "file-c" {
 		t.Fatalf("expected file-c, got %s", images[0].FileID)
+	}
+	for _, path := range []string{"/f/conversation", "/conversation"} {
+		body := requestBodies[path]
+		if got := stringValue(body["client_prepare_state"]); got != "success" {
+			t.Fatalf("%s client_prepare_state = %q, want success", path, got)
+		}
+		gotEncodings, ok := body["supported_encodings"].([]any)
+		if !ok || len(gotEncodings) != 1 || stringValue(gotEncodings[0]) != "v1" {
+			t.Fatalf("%s supported_encodings = %#v, want [\"v1\"]", path, body["supported_encodings"])
+		}
 	}
 }
 
