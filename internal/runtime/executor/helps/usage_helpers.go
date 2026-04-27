@@ -61,6 +61,9 @@ func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context) {
+	if failureUsageSuppressedFromContext(ctx) {
+		return
+	}
 	r.publishWithOutcome(ctx, usage.Detail{}, true)
 }
 

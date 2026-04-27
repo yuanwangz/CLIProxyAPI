@@ -12,7 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/imagesfallback"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -139,9 +142,10 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	selectedAuth := &selectedAuthCapture{}
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, selectedAuth.Set)
+	cliCtx = executorhelps.WithFailureUsageSuppressed(cliCtx)
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
+	dataChan, upstreamHeaders, errChan := h.imageProbeHandler().ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
 	out, errMsg := collectImagesFromResponsesStream(cliCtx, dataChan, errChan, responseFormat)
 	stopKeepAlive()
 
@@ -154,6 +158,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 			}).Warn("openai images: primary responses path failed, switching to codex oauth fallback")
 			fallbackOut, fallbackErr := h.executeImageFallbackAsJSON(cliCtx, selectedAuth.Get(), responseFormat, fallbackReq)
 			if fallbackErr != nil {
+				h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, true)
 				log.WithFields(log.Fields{
 					"auth_id": selectedAuth.Get(),
 					"status":  fallbackErr.StatusCode,
@@ -167,6 +172,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 				}
 				return
 			}
+			h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, false)
 			_, _ = c.Writer.Write(fallbackOut)
 			cliCancel()
 			return
@@ -201,7 +207,8 @@ func (h *OpenAIAPIHandler) streamImagesFromResponsesWithFallback(c *gin.Context,
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	selectedAuth := &selectedAuthCapture{}
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, selectedAuth.Set)
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
+	cliCtx = executorhelps.WithFailureUsageSuppressed(cliCtx)
+	dataChan, upstreamHeaders, errChan := h.imageProbeHandler().ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -242,6 +249,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponsesWithFallback(c *gin.Context,
 				}).Warn("openai images: primary responses stream failed, switching to codex oauth fallback")
 				fallbackErr := h.writeImageFallbackStream(cliCtx, selectedAuth.Get(), responseFormat, streamPrefix, fallbackReq, setSSEHeaders, writeEvent)
 				if fallbackErr != nil {
+					h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, true)
 					log.WithFields(log.Fields{
 						"auth_id": selectedAuth.Get(),
 						"status":  fallbackErr.StatusCode,
@@ -255,6 +263,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponsesWithFallback(c *gin.Context,
 					}
 					return
 				}
+				h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, false)
 				cliCancel(nil)
 				return
 			}
@@ -438,4 +447,34 @@ func errorString(errMsg *interfaces.ErrorMessage) string {
 		return ""
 	}
 	return strings.TrimSpace(errMsg.Error.Error())
+}
+
+func (h *OpenAIAPIHandler) imageProbeHandler() *OpenAIAPIHandler {
+	if h == nil || h.AuthManager == nil {
+		return h
+	}
+	return NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(h.Cfg, h.AuthManager.CloneForProbe()))
+}
+
+func (h *OpenAIAPIHandler) publishImageFallbackFinalUsage(ctx context.Context, authID string, requestedModel string, failed bool) {
+	authID = strings.TrimSpace(authID)
+
+	var auth *coreauth.Auth
+	if h != nil && h.AuthManager != nil && authID != "" {
+		if current, ok := h.AuthManager.GetByID(authID); ok && current != nil {
+			auth = current
+		}
+	}
+
+	usageCtx := executorhelps.WithFailureUsageAllowed(ctx)
+	reporter := executorhelps.NewUsageReporter(usageCtx, "codex", defaultImagesMainModel, auth)
+	if reporter == nil {
+		return
+	}
+	if failed {
+		reporter.PublishFailure(usageCtx)
+		return
+	}
+	reporter.EnsurePublished(usageCtx)
+	reporter.PublishAdditionalModel(usageCtx, firstNonEmptyString(strings.TrimSpace(requestedModel), defaultImagesToolModel), coreusage.Detail{})
 }
