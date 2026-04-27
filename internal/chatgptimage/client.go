@@ -488,6 +488,7 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 		}
 		if pollErr != nil {
 			log.WithError(pollErr).WithField("conversation_id", conversationID).Debug("chatgpt image: empty stream recovery did not produce images")
+			return nil, pollErr
 		}
 	}
 	return nil, &statusError{statusCode: http.StatusBadGateway, message: "no images generated"}
@@ -594,8 +595,10 @@ func (c *ChatGPTClient) fetchConversationImages(ctx context.Context, conversatio
 		return nil, fmt.Errorf("decode conversation: %w", err)
 	}
 
-	var images []imageResult
-	seen := make(map[string]struct{})
+	var (
+		images []imageResult
+		seen   map[string]struct{}
+	)
 	var visit func(string)
 	visit = func(nodeID string) {
 		if nodeID == "" {
@@ -618,9 +621,19 @@ func (c *ChatGPTClient) fetchConversationImages(ctx context.Context, conversatio
 	}
 
 	if rootMessageID != "" {
+		seen = make(map[string]struct{})
 		visit(rootMessageID)
-		return images, nil
+		if len(images) > 0 {
+			return images, nil
+		}
+		log.WithFields(log.Fields{
+			"conversation_id": conversationID,
+			"root_message_id": rootMessageID,
+		}).Debug("chatgpt image: submitted branch did not yield images, scanning full conversation")
 	}
+
+	images = nil
+	seen = make(map[string]struct{})
 	for nodeID := range conv.Mapping {
 		visit(nodeID)
 	}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/imagesfallback"
@@ -147,16 +148,18 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 
 	dataChan, upstreamHeaders, errChan := h.imageProbeHandler().ExecuteStreamWithAuthManager(cliCtx, "openai-response", defaultImagesMainModel, responsesReq, "")
 	out, errMsg := collectImagesFromResponsesStream(cliCtx, dataChan, errChan, responseFormat)
-	stopKeepAlive()
 
 	if errMsg != nil {
 		if h.shouldUseImageFallback(errMsg, selectedAuth.Get()) {
+			stopKeepAlive()
 			log.WithFields(log.Fields{
 				"auth_id": selectedAuth.Get(),
 				"status":  errMsg.StatusCode,
 				"error":   errorString(errMsg),
 			}).Warn("openai images: primary responses path failed, switching to codex oauth fallback")
+			stopFallbackKeepAlive := startImageFallbackJSONKeepAlive(c, cliCtx)
 			fallbackOut, fallbackErr := h.executeImageFallbackAsJSON(cliCtx, selectedAuth.Get(), responseFormat, fallbackReq)
+			stopFallbackKeepAlive()
 			if fallbackErr != nil {
 				h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, true)
 				log.WithFields(log.Fields{
@@ -178,6 +181,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 			return
 		}
 
+		stopKeepAlive()
 		h.WriteErrorResponse(c, errMsg)
 		if errMsg.Error != nil {
 			cliCancel(errMsg.Error)
@@ -187,9 +191,52 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 		return
 	}
 
+	stopKeepAlive()
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(out)
 	cliCancel()
+}
+
+func startImageFallbackJSONKeepAlive(c *gin.Context, ctx context.Context) func() {
+	if c == nil {
+		return func() {}
+	}
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		return func() {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	const heartbeatInterval = 15 * time.Second
+	stopChan := make(chan struct{})
+	var stopOnce sync.Once
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopChan:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = c.Writer.Write([]byte("\n"))
+				flusher.Flush()
+			}
+		}
+	}()
+
+	return func() {
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
+		wg.Wait()
+	}
 }
 
 func (h *OpenAIAPIHandler) streamImagesFromResponsesWithFallback(c *gin.Context, responsesReq []byte, responseFormat string, streamPrefix string, fallbackReq imagesfallback.Request) {

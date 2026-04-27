@@ -404,6 +404,112 @@ func TestFetchConversationImagesRestrictsToSubmittedBranch(t *testing.T) {
 	}
 }
 
+func TestFetchConversationImagesFallsBackToFullConversationScan(t *testing.T) {
+	conversationJSON := `{
+		"mapping": {
+			"user-1": {
+				"message": {
+					"id": "user-1",
+					"author": {"role": "user"},
+					"status": "finished_successfully",
+					"content": {"content_type": "text", "parts": ["prompt"]}
+				},
+				"children": ["tool-progress"]
+			},
+			"tool-progress": {
+				"message": {
+					"id": "tool-progress",
+					"author": {"role": "tool"},
+					"status": "in_progress",
+					"content": {"content_type": "text", "parts": ["working"]}
+				}
+			},
+			"detached-tool": {
+				"message": {
+					"id": "detached-tool",
+					"author": {"role": "tool"},
+					"status": "finished_successfully",
+					"content": {
+						"content_type": "multimodal_text",
+						"parts": [
+							{
+								"content_type": "image_asset_pointer",
+								"asset_pointer": "sediment://file-detached",
+								"metadata": {"dalle": {"gen_id": "gen-detached", "prompt": "prompt"}}
+							}
+						]
+					}
+				}
+			}
+		}
+	}`
+
+	client := &ChatGPTClient{
+		accessToken: "token",
+		oaiDeviceID: "device",
+		apiClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/conversation/conv-fallback"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(conversationJSON)),
+					}, nil
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/attachment/file-detached/download"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"download_url":"https://files.example/detached.png"}`)),
+					}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	images, err := client.fetchConversationImages(context.Background(), "conv-fallback", "user-1")
+	if err != nil {
+		t.Fatalf("fetchConversationImages returned error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected exactly one image, got %d", len(images))
+	}
+	if images[0].FileID != "file-detached" {
+		t.Fatalf("expected file-detached, got %s", images[0].FileID)
+	}
+}
+
+func TestParseSSEReturnsPollErrorWhenRecoveryContextIsCanceled(t *testing.T) {
+	client := &ChatGPTClient{
+		accessToken:  "token",
+		oaiDeviceID:  "device",
+		apiClient:    &http.Client{},
+		pollInterval: time.Millisecond,
+		pollMaxWait:  time.Second,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stream := strings.Join([]string{
+		`data: {"conversation_id":"conv-canceled","message":{"id":"tool-canceled","author":{"role":"tool"},"status":"in_progress","content":{"content_type":"text","parts":["still working"]}}}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	_, err := client.parseSSE(ctx, strings.NewReader(stream), conversationRequestContext{
+		ConversationID:     "conv-canceled",
+		SubmittedMessageID: "user-canceled",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+}
+
 func TestGenerateImagePrefersFConversation(t *testing.T) {
 	client := &ChatGPTClient{
 		accessToken: "token",
