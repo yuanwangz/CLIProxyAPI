@@ -27,7 +27,6 @@ const (
 	apiBaseURL          = "https://chatgpt.com/backend-api"
 	defaultPollInterval = 3 * time.Second
 	defaultPollMaxWait  = 10 * time.Minute
-	emptyStreamPollWait = 15 * time.Second
 )
 
 type Backend struct {
@@ -482,7 +481,8 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 		return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
 	}
 	if conversationID != "" {
-		recovered, pollErr := c.pollForImagesWithWait(ctx, conversationID, requestContext.SubmittedMessageID, minDuration(c.pollMaxWait, emptyStreamPollWait))
+		log.WithField("conversation_id", conversationID).Debug("chatgpt image: stream ended without inline images, polling conversation for delayed image results")
+		recovered, pollErr := c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
 		if pollErr == nil && len(recovered) > 0 {
 			return recovered, nil
 		}
@@ -981,19 +981,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func minDuration(values ...time.Duration) time.Duration {
-	var min time.Duration
-	for _, value := range values {
-		if value <= 0 {
-			continue
-		}
-		if min <= 0 || value < min {
-			min = value
-		}
-	}
-	return min
 }
 
 func isChatGPTHost(raw string) bool {

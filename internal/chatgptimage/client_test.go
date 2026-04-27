@@ -113,6 +113,116 @@ func TestParseSSEWithoutAsyncRecoversFromConversation(t *testing.T) {
 	}
 }
 
+func TestParseSSEWithoutAsyncPollsUntilDelayedConversationImageAppears(t *testing.T) {
+	var conversationFetches int
+	client := &ChatGPTClient{
+		accessToken: "token",
+		oaiDeviceID: "device",
+		apiClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/conversation/conv-delay"):
+					conversationFetches++
+					if conversationFetches < 4 {
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Header:     make(http.Header),
+							Body: io.NopCloser(strings.NewReader(`{
+								"mapping": {
+									"user-delay": {
+										"message": {
+											"id": "user-delay",
+											"author": {"role": "user"},
+											"status": "finished_successfully",
+											"content": {"content_type": "text", "parts": ["prompt"]}
+										},
+										"children": ["tool-delay"]
+									},
+									"tool-delay": {
+										"message": {
+											"id": "tool-delay",
+											"author": {"role": "tool"},
+											"status": "in_progress",
+											"content": {"content_type": "text", "parts": ["still working"]}
+										}
+									}
+								}
+							}`)),
+						}, nil
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body: io.NopCloser(strings.NewReader(`{
+							"mapping": {
+								"user-delay": {
+									"message": {
+										"id": "user-delay",
+										"author": {"role": "user"},
+										"status": "finished_successfully",
+										"content": {"content_type": "text", "parts": ["prompt"]}
+									},
+									"children": ["tool-delay"]
+								},
+								"tool-delay": {
+									"message": {
+										"id": "tool-delay",
+										"author": {"role": "tool"},
+										"status": "finished_successfully",
+										"content": {
+											"content_type": "multimodal_text",
+											"parts": [{
+												"content_type": "image_asset_pointer",
+												"asset_pointer": "sediment://file-delay",
+												"metadata": {"dalle": {"gen_id": "gen-delay", "prompt": "prompt"}}
+											}]
+										}
+									}
+								}
+							}
+						}`)),
+					}, nil
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/attachment/file-delay/download"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"download_url":"https://files.example/delay.png"}`)),
+					}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+					return nil, nil
+				}
+			}),
+		},
+		pollInterval: 5 * time.Millisecond,
+		pollMaxWait:  100 * time.Millisecond,
+	}
+
+	stream := strings.Join([]string{
+		`data: {"conversation_id":"conv-delay","message":{"id":"tool-delay","author":{"role":"tool"},"status":"in_progress","content":{"content_type":"text","parts":["still working"]}}}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	images, err := client.parseSSE(context.Background(), strings.NewReader(stream), conversationRequestContext{
+		ConversationID:     "conv-delay",
+		SubmittedMessageID: "user-delay",
+	})
+	if err != nil {
+		t.Fatalf("parseSSE returned error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected one recovered image, got %d", len(images))
+	}
+	if images[0].FileID != "file-delay" {
+		t.Fatalf("expected recovered file-delay, got %s", images[0].FileID)
+	}
+	if conversationFetches < 4 {
+		t.Fatalf("expected multiple delayed conversation fetches, got %d", conversationFetches)
+	}
+}
+
 func TestParseSSEReadErrorRecoversByPollingConversation(t *testing.T) {
 	client := &ChatGPTClient{
 		accessToken: "token",
