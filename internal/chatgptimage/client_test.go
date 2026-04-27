@@ -484,11 +484,12 @@ func TestFetchConversationImagesFallsBackToFullConversationScan(t *testing.T) {
 
 func TestParseSSEReturnsPollErrorWhenRecoveryContextIsCanceled(t *testing.T) {
 	client := &ChatGPTClient{
-		accessToken:  "token",
-		oaiDeviceID:  "device",
-		apiClient:    &http.Client{},
-		pollInterval: time.Millisecond,
-		pollMaxWait:  time.Second,
+		accessToken:         "token",
+		oaiDeviceID:         "device",
+		apiClient:           &http.Client{},
+		pollInterval:        time.Millisecond,
+		pollMaxWait:         time.Second,
+		pollRateLimitBudget: time.Second,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -507,6 +508,116 @@ func TestParseSSEReturnsPollErrorWhenRecoveryContextIsCanceled(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context canceled, got %v", err)
+	}
+}
+
+func TestPollForImagesBacksOffAfterRateLimitAndEventuallySucceeds(t *testing.T) {
+	var conversationFetches int
+	client := &ChatGPTClient{
+		accessToken:         "token",
+		oaiDeviceID:         "device",
+		pollInterval:        time.Millisecond,
+		pollMaxWait:         200 * time.Millisecond,
+		pollRateLimitBudget: time.Second,
+		apiClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/conversation/conv-rate-limit"):
+					conversationFetches++
+					if conversationFetches < 3 {
+						header := make(http.Header)
+						header.Set("Retry-After", "0")
+						return &http.Response{
+							StatusCode: http.StatusTooManyRequests,
+							Header:     header,
+							Body:       io.NopCloser(strings.NewReader(`{"detail":"Too many requests"}`)),
+						}, nil
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body: io.NopCloser(strings.NewReader(`{
+							"mapping": {
+								"user-1": {
+									"message": {
+										"id": "user-1",
+										"author": {"role": "user"},
+										"status": "finished_successfully",
+										"content": {"content_type": "text", "parts": ["prompt"]}
+									},
+									"children": ["tool-1"]
+								},
+								"tool-1": {
+									"message": {
+										"id": "tool-1",
+										"author": {"role": "tool"},
+										"status": "finished_successfully",
+										"content": {
+											"content_type": "multimodal_text",
+											"parts": [{
+												"content_type": "image_asset_pointer",
+												"asset_pointer": "sediment://file-1",
+												"metadata": {"dalle": {"gen_id": "gen-1", "prompt": "prompt"}}
+											}]
+										}
+									}
+								}
+							}
+						}`)),
+					}, nil
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/attachment/file-1/download"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"download_url":"https://files.example/1.png"}`)),
+					}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	images, err := client.pollForImages(context.Background(), "conv-rate-limit", "user-1")
+	if err != nil {
+		t.Fatalf("pollForImages returned error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected one recovered image, got %d", len(images))
+	}
+	if conversationFetches != 3 {
+		t.Fatalf("expected 3 conversation fetches, got %d", conversationFetches)
+	}
+}
+
+func TestPollForImagesStopsAfterRateLimitBudget(t *testing.T) {
+	client := &ChatGPTClient{
+		accessToken:         "token",
+		oaiDeviceID:         "device",
+		pollInterval:        time.Millisecond,
+		pollMaxWait:         time.Second,
+		pollRateLimitBudget: 20 * time.Millisecond,
+		apiClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodGet || !strings.HasSuffix(req.URL.Path, "/conversation/conv-budget") {
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+				}
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"detail":"Too many requests"}`)),
+				}, nil
+			}),
+		},
+	}
+
+	_, err := client.pollForImages(context.Background(), "conv-budget", "user-1")
+	if err == nil {
+		t.Fatal("expected rate limit error, got nil")
+	}
+	if statusCode(err) != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 status, got %d (%v)", statusCode(err), err)
 	}
 }
 

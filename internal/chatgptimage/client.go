@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,9 +25,11 @@ import (
 )
 
 const (
-	apiBaseURL          = "https://chatgpt.com/backend-api"
-	defaultPollInterval = 3 * time.Second
-	defaultPollMaxWait  = 10 * time.Minute
+	apiBaseURL                  = "https://chatgpt.com/backend-api"
+	defaultPollInterval         = 3 * time.Second
+	defaultPollMaxWait          = 10 * time.Minute
+	defaultPollRateLimitBudget  = 2 * time.Minute
+	defaultPollRateLimitBackoff = 30 * time.Second
 )
 
 type Backend struct {
@@ -90,15 +93,16 @@ func (b *Backend) Execute(ctx context.Context, auth *coreauth.Auth, req Request)
 }
 
 type ChatGPTClient struct {
-	accessToken  string
-	cookies      string
-	oaiDeviceID  string
-	userAgent    string
-	apiClient    *http.Client
-	streamClient *http.Client
-	plainClient  *http.Client
-	pollInterval time.Duration
-	pollMaxWait  time.Duration
+	accessToken         string
+	cookies             string
+	oaiDeviceID         string
+	userAgent           string
+	apiClient           *http.Client
+	streamClient        *http.Client
+	plainClient         *http.Client
+	pollInterval        time.Duration
+	pollMaxWait         time.Duration
+	pollRateLimitBudget time.Duration
 }
 
 func newChatGPTClient(auth *coreauth.Auth, cfg *sdkconfig.SDKConfig) (*ChatGPTClient, error) {
@@ -129,15 +133,16 @@ func newChatGPTClient(auth *coreauth.Auth, cfg *sdkconfig.SDKConfig) (*ChatGPTCl
 	}
 
 	return &ChatGPTClient{
-		accessToken:  accessToken,
-		cookies:      firstNonEmpty(metadataString(auth, "cookies"), metadataString(auth, "cookie"), attributeHeader(auth, "Cookie")),
-		oaiDeviceID:  firstNonEmpty(metadataString(auth, "oai-device-id"), metadataString(auth, "oai_device_id"), attributeHeader(auth, "oai-device-id"), uuid.NewString()),
-		userAgent:    defaultUserAgent,
-		apiClient:    &http.Client{Transport: apiTransport},
-		streamClient: &http.Client{Transport: streamTransport},
-		plainClient:  &http.Client{Transport: plainTransport},
-		pollInterval: defaultPollInterval,
-		pollMaxWait:  defaultPollMaxWait,
+		accessToken:         accessToken,
+		cookies:             firstNonEmpty(metadataString(auth, "cookies"), metadataString(auth, "cookie"), attributeHeader(auth, "Cookie")),
+		oaiDeviceID:         firstNonEmpty(metadataString(auth, "oai-device-id"), metadataString(auth, "oai_device_id"), attributeHeader(auth, "oai-device-id"), uuid.NewString()),
+		userAgent:           defaultUserAgent,
+		apiClient:           &http.Client{Transport: apiTransport},
+		streamClient:        &http.Client{Transport: streamTransport},
+		plainClient:         &http.Client{Transport: plainTransport},
+		pollInterval:        defaultPollInterval,
+		pollMaxWait:         defaultPollMaxWait,
+		pollRateLimitBudget: defaultPollRateLimitBudget,
 	}, nil
 }
 
@@ -555,18 +560,45 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 		maxWait = c.pollMaxWait
 	}
 	deadline := time.Now().Add(maxWait)
+	pollDelay := normalizedPollInterval(c.pollInterval)
+	rateLimitBudget := c.pollRateLimitBudget
+	if rateLimitBudget <= 0 {
+		rateLimitBudget = defaultPollRateLimitBudget
+	}
+	var rateLimitedSince time.Time
 	for time.Now().Before(deadline) {
+		if err := waitForNextConversationPoll(ctx, deadline, pollDelay); err != nil {
+			return nil, err
+		}
+
 		images, err := c.fetchConversationImages(ctx, conversationID, rootMessageID)
 		if err != nil {
+			if statusCode(err) == http.StatusTooManyRequests {
+				if rateLimitedSince.IsZero() {
+					rateLimitedSince = time.Now()
+				}
+				pollDelay = nextConversationPollDelay(err, pollDelay)
+				if time.Since(rateLimitedSince) >= rateLimitBudget {
+					return nil, &statusError{
+						statusCode: http.StatusTooManyRequests,
+						message:    "chatgpt image conversation polling rate limited for too long",
+						retryAfter: pollDelay,
+					}
+				}
+				log.WithError(err).WithFields(log.Fields{
+					"conversation_id": conversationID,
+					"next_delay":      pollDelay.String(),
+				}).Warn("chatgpt image: conversation poll rate limited, backing off")
+				continue
+			}
+			rateLimitedSince = time.Time{}
+			pollDelay = normalizedPollInterval(c.pollInterval)
 			log.WithError(err).WithField("conversation_id", conversationID).Warn("chatgpt image: poll conversation failed")
 		} else if len(images) > 0 {
 			return images, nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(c.pollInterval):
+		} else {
+			rateLimitedSince = time.Time{}
+			pollDelay = normalizedPollInterval(c.pollInterval)
 		}
 	}
 	return nil, &statusError{statusCode: http.StatusGatewayTimeout, message: "timed out waiting for async image generation"}
@@ -942,6 +974,7 @@ func responseStatusError(action string, resp *http.Response) error {
 	if resp == nil {
 		return &statusError{statusCode: http.StatusBadGateway, message: action + " failed"}
 	}
+	retryAfter := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	message := strings.TrimSpace(string(body))
 	if message == "" {
@@ -950,7 +983,87 @@ func responseStatusError(action string, resp *http.Response) error {
 	if action != "" {
 		message = fmt.Sprintf("%s returned %d: %s", action, resp.StatusCode, message)
 	}
-	return &statusError{statusCode: resp.StatusCode, message: message}
+	return &statusError{statusCode: resp.StatusCode, message: message, retryAfter: retryAfter}
+}
+
+func waitForNextConversationPoll(ctx context.Context, deadline time.Time, delay time.Duration) error {
+	if delay <= 0 {
+		delay = defaultPollInterval
+	}
+	if remaining := time.Until(deadline); remaining < delay {
+		delay = remaining
+	}
+	if delay <= 0 {
+		return &statusError{statusCode: http.StatusGatewayTimeout, message: "timed out waiting for async image generation"}
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func normalizedPollInterval(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return defaultPollInterval
+	}
+	return delay
+}
+
+func nextConversationPollDelay(err error, previous time.Duration) time.Duration {
+	if retryAfter := retryAfterDuration(err); retryAfter > 0 {
+		return clampConversationPollDelay(retryAfter)
+	}
+	if previous <= 0 {
+		previous = defaultPollInterval
+	}
+	return clampConversationPollDelay(previous * 2)
+}
+
+func clampConversationPollDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return defaultPollInterval
+	}
+	if delay > defaultPollRateLimitBackoff {
+		return defaultPollRateLimitBackoff
+	}
+	return delay
+}
+
+func retryAfterDuration(err error) time.Duration {
+	type retryAfterCoder interface {
+		RetryAfter() time.Duration
+	}
+
+	var coded retryAfterCoder
+	if errors.As(err, &coded) {
+		return coded.RetryAfter()
+	}
+	return 0
+}
+
+func parseRetryAfterHeader(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(raw); err == nil {
+		if delay := time.Until(when); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 func closeBody(body io.Closer) {

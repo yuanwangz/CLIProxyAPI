@@ -1,5 +1,7 @@
 package chatgptimage
 
+import "time"
+
 type Operation string
 
 const (
@@ -44,6 +46,7 @@ type GeneratedImage struct {
 type statusError struct {
 	statusCode int
 	message    string
+	retryAfter time.Duration
 }
 
 func (e *statusError) Error() string {
@@ -58,4 +61,11 @@ func (e *statusError) StatusCode() int {
 		return 0
 	}
 	return e.statusCode
+}
+
+func (e *statusError) RetryAfter() time.Duration {
+	if e == nil || e.retryAfter <= 0 {
+		return 0
+	}
+	return e.retryAfter
 }
