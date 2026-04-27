@@ -444,6 +444,16 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 				conversationID = cid
 			}
 		}
+		if rawType, ok := raw["type"]; ok {
+			var eventType string
+			if json.Unmarshal(rawType, &eventType) == nil &&
+				eventType == "message_stream_complete" &&
+				asyncMode &&
+				conversationID != "" {
+				log.WithField("conversation_id", conversationID).Debug("chatgpt image: async message stream completed, polling conversation")
+				return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
+			}
+		}
 		if rawAS, ok := raw["async_status"]; ok {
 			var status int
 			if json.Unmarshal(rawAS, &status) == nil && status > 0 {
@@ -459,6 +469,10 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 		msg := event.Message
 		if requestContext.ParentMessageID != "" && msg.ID == requestContext.ParentMessageID {
 			continue
+		}
+		if isAsyncImagePendingMessage(msg) && conversationID != "" {
+			log.WithField("conversation_id", conversationID).Debug("chatgpt image: async image placeholder received, polling conversation")
+			return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
 		}
 		images = append(images, c.extractImages(ctx, msg, conversationID)...)
 	}
@@ -1294,6 +1308,29 @@ func stringValue(raw any) string {
 	return ""
 }
 
+func isAsyncImagePendingMessage(msg *sseMessage) bool {
+	if msg == nil || len(msg.Metadata) == 0 {
+		return false
+	}
+	for _, key := range []string{"image_gen_async", "trigger_async_ux"} {
+		raw, ok := msg.Metadata[key]
+		if !ok || len(raw) == 0 {
+			continue
+		}
+		var value bool
+		if json.Unmarshal(raw, &value) == nil && value {
+			return true
+		}
+	}
+	if rawTaskID, ok := msg.Metadata["image_gen_task_id"]; ok {
+		var taskID string
+		if json.Unmarshal(rawTaskID, &taskID) == nil && strings.TrimSpace(taskID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 type sseEvent struct {
 	ConversationID string      `json:"conversation_id"`
 	Message        *sseMessage `json:"message"`
@@ -1309,6 +1346,7 @@ type sseMessage struct {
 		ContentType string            `json:"content_type"`
 		Parts       []json.RawMessage `json:"parts"`
 	} `json:"content"`
+	Metadata map[string]json.RawMessage `json:"metadata"`
 }
 
 type sseImagePart struct {

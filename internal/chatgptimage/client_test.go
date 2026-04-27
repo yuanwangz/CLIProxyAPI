@@ -299,6 +299,99 @@ func TestParseSSEReadErrorRecoversByPollingConversation(t *testing.T) {
 	}
 }
 
+func TestParseSSEAsyncPlaceholderPollsConversationWithoutWaitingForDone(t *testing.T) {
+	client := &ChatGPTClient{
+		accessToken: "token",
+		oaiDeviceID: "device",
+		apiClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/conversation/conv-async"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body: io.NopCloser(strings.NewReader(`{
+							"mapping": {
+								"user-async": {
+									"message": {
+										"id": "user-async",
+										"author": {"role": "user"},
+										"status": "finished_successfully",
+										"content": {"content_type": "text", "parts": ["prompt"]}
+									},
+									"children": ["tool-pending"]
+								},
+								"tool-pending": {
+									"message": {
+										"id": "tool-pending",
+										"author": {"role": "tool"},
+										"status": "finished_successfully",
+										"content": {"content_type": "text", "parts": ["working"]},
+										"metadata": {
+											"image_gen_async": true,
+											"trigger_async_ux": true,
+											"image_gen_task_id": "task-1"
+										}
+									},
+									"children": ["tool-final"]
+								},
+								"tool-final": {
+									"message": {
+										"id": "tool-final",
+										"author": {"role": "tool"},
+										"status": "finished_successfully",
+										"content": {
+											"content_type": "multimodal_text",
+											"parts": [{
+												"content_type": "image_asset_pointer",
+												"asset_pointer": "sediment://file-async",
+												"metadata": {"dalle": {"gen_id": "gen-async", "prompt": "prompt"}}
+											}]
+										}
+									}
+								}
+							}
+						}`)),
+					}, nil
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/attachment/file-async/download"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"download_url":"https://files.example/async.png"}`)),
+					}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+					return nil, nil
+				}
+			}),
+		},
+		pollInterval:        time.Millisecond,
+		pollMaxWait:         time.Second,
+		pollRateLimitBudget: time.Second,
+	}
+
+	stream := strings.Join([]string{
+		`data: {"conversation_id":"conv-async","message":{"id":"tool-pending","author":{"role":"tool"},"status":"finished_successfully","content":{"content_type":"text","parts":["working"]},"metadata":{"image_gen_async":true,"trigger_async_ux":true,"image_gen_task_id":"task-1"}}}`,
+		"",
+		`data: {"type":"message_stream_complete","conversation_id":"conv-async"}`,
+		"",
+	}, "\n")
+
+	images, err := client.parseSSE(context.Background(), strings.NewReader(stream), conversationRequestContext{
+		ConversationID:     "conv-async",
+		SubmittedMessageID: "user-async",
+	})
+	if err != nil {
+		t.Fatalf("parseSSE returned error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected one recovered image, got %d", len(images))
+	}
+	if images[0].FileID != "file-async" {
+		t.Fatalf("expected recovered file-async, got %s", images[0].FileID)
+	}
+}
+
 func TestFetchConversationImagesRestrictsToSubmittedBranch(t *testing.T) {
 	conversationJSON := `{
 		"mapping": {
