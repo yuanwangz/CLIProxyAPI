@@ -163,7 +163,7 @@ func (c *ChatGPTClient) GenerateImage(ctx context.Context, prompt, model, size, 
 
 	body := c.buildConversationBody(fullPrompt, model, "", "", nil)
 	fBody := cloneConversationBody(body)
-	fBody["client_prepare_state"] = "none"
+	fBody["client_prepare_state"] = "success"
 	fBody["supported_encodings"] = []string{"v1"}
 
 	images, err := c.doFConversation(ctx, fBody)
@@ -582,12 +582,13 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 		rateLimitBudget = defaultPollRateLimitBudget
 	}
 	var rateLimitedSince time.Time
+	lastSnapshot := conversationPollSnapshot{}
 	for time.Now().Before(deadline) {
 		if err := waitForNextConversationPoll(ctx, deadline, pollDelay); err != nil {
 			return nil, err
 		}
 
-		images, err := c.fetchConversationImages(ctx, conversationID, rootMessageID)
+		images, snapshot, err := c.fetchConversationImagesDetailed(ctx, conversationID, rootMessageID)
 		if err != nil {
 			if statusCode(err) == http.StatusTooManyRequests {
 				if rateLimitedSince.IsZero() {
@@ -615,38 +616,51 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 		} else {
 			rateLimitedSince = time.Time{}
 			pollDelay = normalizedPollInterval(c.pollInterval)
+			if snapshot.Signature() != "" && snapshot.Signature() != lastSnapshot.Signature() {
+				log.WithFields(snapshot.LogFields(conversationID)).Info("chatgpt image: conversation state updated without image output")
+				lastSnapshot = snapshot
+			}
 		}
 	}
 	return nil, &statusError{statusCode: http.StatusGatewayTimeout, message: "timed out waiting for async image generation"}
 }
 
 func (c *ChatGPTClient) fetchConversationImages(ctx context.Context, conversationID, rootMessageID string) ([]imageResult, error) {
+	images, _, err := c.fetchConversationImagesDetailed(ctx, conversationID, rootMessageID)
+	return images, err
+}
+
+func (c *ChatGPTClient) fetchConversationImagesDetailed(ctx context.Context, conversationID, rootMessageID string) ([]imageResult, conversationPollSnapshot, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiBaseURL+"/conversation/"+url.PathEscape(conversationID), nil)
 	c.setAPIHeaders(req)
 
 	resp, err := c.apiClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, conversationPollSnapshot{}, err
 	}
 	defer closeBody(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, responseStatusError("fetch conversation", resp)
+		return nil, conversationPollSnapshot{}, responseStatusError("fetch conversation", resp)
 	}
 
 	var conv struct {
-		Mapping map[string]struct {
-			Message  *sseMessage `json:"message"`
-			Children []string    `json:"children"`
-		} `json:"mapping"`
+		CurrentNode string                      `json:"current_node"`
+		AsyncStatus int                         `json:"async_status"`
+		Mapping     map[string]conversationNode `json:"mapping"`
 	}
 	if err = json.NewDecoder(resp.Body).Decode(&conv); err != nil {
-		return nil, fmt.Errorf("decode conversation: %w", err)
+		return nil, conversationPollSnapshot{}, fmt.Errorf("decode conversation: %w", err)
 	}
 
 	var (
 		images []imageResult
 		seen   map[string]struct{}
 	)
+	snapshot := conversationPollSnapshot{
+		AsyncStatus: conv.AsyncStatus,
+		CurrentNode: strings.TrimSpace(conv.CurrentNode),
+		NodeCount:   len(conv.Mapping),
+	}
 	var visit func(string)
 	visit = func(nodeID string) {
 		if nodeID == "" {
@@ -672,7 +686,7 @@ func (c *ChatGPTClient) fetchConversationImages(ctx context.Context, conversatio
 		seen = make(map[string]struct{})
 		visit(rootMessageID)
 		if len(images) > 0 {
-			return images, nil
+			return images, snapshot, nil
 		}
 		log.WithFields(log.Fields{
 			"conversation_id": conversationID,
@@ -685,7 +699,8 @@ func (c *ChatGPTClient) fetchConversationImages(ctx context.Context, conversatio
 	for nodeID := range conv.Mapping {
 		visit(nodeID)
 	}
-	return images, nil
+	snapshot.Populate(conv.Mapping)
+	return images, snapshot, nil
 }
 
 func (c *ChatGPTClient) getAttachmentURL(ctx context.Context, fileID, conversationID string) (string, error) {
@@ -745,12 +760,15 @@ func (c *ChatGPTClient) buildConversationBody(prompt, model, conversationID, par
 		parentMsgID = "client-created-root"
 	}
 	model = firstNonEmpty(strings.TrimSpace(model), "gpt-5.4-mini")
+	now := time.Now()
+	timezoneOffsetMin, timezoneName := webTimezone(now)
 
 	metadata := map[string]any{
-		"system_hints": []string{"picture_v2"},
 		"serialization_metadata": map[string]any{
 			"custom_symbol_offsets": []any{},
 		},
+		"selected_github_repos":     []any{},
+		"selected_all_github_repos": false,
 	}
 	if dalleOp != nil {
 		metadata["dalle"] = map[string]any{
@@ -761,8 +779,9 @@ func (c *ChatGPTClient) buildConversationBody(prompt, model, conversationID, par
 	}
 
 	msg := map[string]any{
-		"id":     msgID,
-		"author": map[string]any{"role": "user"},
+		"id":          msgID,
+		"author":      map[string]any{"role": "user"},
+		"create_time": float64(now.UnixMilli()) / 1000,
 		"content": map[string]any{
 			"content_type": "text",
 			"parts":        []string{prompt},
@@ -771,27 +790,18 @@ func (c *ChatGPTClient) buildConversationBody(prompt, model, conversationID, par
 	}
 
 	body := map[string]any{
-		"action":                   "next",
-		"messages":                 []any{msg},
-		"parent_message_id":        parentMsgID,
-		"model":                    model,
-		"timezone_offset_min":      420,
-		"timezone":                 "America/Los_Angeles",
-		"conversation_mode":        map[string]any{"kind": "primary_assistant"},
-		"enable_message_followups": true,
-		"system_hints":             []string{"picture_v2"},
-		"supports_buffering":       true,
-		"supported_encodings":      []string{},
-		"client_contextual_info": map[string]any{
-			"is_dark_mode":      true,
-			"time_since_loaded": 1000,
-			"page_height":       717,
-			"page_width":        1200,
-			"pixel_ratio":       2,
-			"screen_height":     878,
-			"screen_width":      1352,
-			"app_name":          "chatgpt.com",
-		},
+		"action":                               "next",
+		"messages":                             []any{msg},
+		"parent_message_id":                    parentMsgID,
+		"model":                                model,
+		"timezone_offset_min":                  timezoneOffsetMin,
+		"timezone":                             timezoneName,
+		"conversation_mode":                    map[string]any{"kind": "primary_assistant"},
+		"enable_message_followups":             true,
+		"system_hints":                         []any{},
+		"supports_buffering":                   true,
+		"supported_encodings":                  []string{},
+		"client_contextual_info":               defaultWebClientContext(),
 		"paragen_cot_summary_display_override": "allow",
 		"force_parallel_switch":                "auto",
 	}
@@ -1310,6 +1320,31 @@ func stringValue(raw any) string {
 	return ""
 }
 
+func defaultWebClientContext() map[string]any {
+	return map[string]any{
+		"is_dark_mode":      false,
+		"time_since_loaded": 25,
+		"page_height":       1138,
+		"page_width":        526,
+		"pixel_ratio":       3,
+		"screen_height":     844,
+		"screen_width":      390,
+		"app_name":          "chatgpt.com",
+	}
+}
+
+func webTimezone(now time.Time) (int, string) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	location := strings.TrimSpace(now.Location().String())
+	if location == "" || location == "Local" {
+		location = "Asia/Shanghai"
+	}
+	_, offsetSeconds := now.Zone()
+	return -offsetSeconds / 60, location
+}
+
 func isAsyncImagePendingMessage(msg *sseMessage) bool {
 	if msg == nil || len(msg.Metadata) == 0 {
 		return false
@@ -1339,9 +1374,11 @@ type sseEvent struct {
 }
 
 type sseMessage struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-	Author struct {
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	Recipient string `json:"recipient"`
+	Channel   string `json:"channel"`
+	Author    struct {
 		Role string `json:"role"`
 	} `json:"author"`
 	Content struct {
@@ -1349,6 +1386,11 @@ type sseMessage struct {
 		Parts       []json.RawMessage `json:"parts"`
 	} `json:"content"`
 	Metadata map[string]json.RawMessage `json:"metadata"`
+}
+
+type conversationNode struct {
+	Message  *sseMessage `json:"message"`
+	Children []string    `json:"children"`
 }
 
 type sseImagePart struct {
@@ -1360,4 +1402,73 @@ type sseImagePart struct {
 			Prompt string `json:"prompt"`
 		} `json:"dalle"`
 	} `json:"metadata"`
+}
+
+type conversationPollSnapshot struct {
+	AsyncStatus             int
+	CurrentNode             string
+	NodeCount               int
+	CurrentRole             string
+	CurrentContentType      string
+	CurrentStatus           string
+	CurrentRecipient        string
+	CurrentChannel          string
+	CurrentHasImagePointer  bool
+	CurrentAsyncPlaceholder bool
+}
+
+func (s *conversationPollSnapshot) Populate(mapping map[string]conversationNode) {
+	if s == nil || len(mapping) == 0 {
+		return
+	}
+	node, ok := mapping[s.CurrentNode]
+	if !ok || node.Message == nil {
+		return
+	}
+	s.CurrentRole = strings.TrimSpace(node.Message.Author.Role)
+	s.CurrentContentType = strings.TrimSpace(node.Message.Content.ContentType)
+	s.CurrentStatus = strings.TrimSpace(node.Message.Status)
+	s.CurrentRecipient = strings.TrimSpace(node.Message.Recipient)
+	s.CurrentChannel = strings.TrimSpace(node.Message.Channel)
+	s.CurrentAsyncPlaceholder = isAsyncImagePendingMessage(node.Message)
+	for _, rawPart := range node.Message.Content.Parts {
+		var part sseImagePart
+		if err := json.Unmarshal(rawPart, &part); err == nil &&
+			strings.TrimSpace(part.ContentType) == "image_asset_pointer" &&
+			strings.TrimSpace(part.AssetPointer) != "" {
+			s.CurrentHasImagePointer = true
+			break
+		}
+	}
+}
+
+func (s conversationPollSnapshot) Signature() string {
+	return strings.Join([]string{
+		strconv.Itoa(s.AsyncStatus),
+		s.CurrentNode,
+		s.CurrentRole,
+		s.CurrentContentType,
+		s.CurrentStatus,
+		s.CurrentRecipient,
+		s.CurrentChannel,
+		strconv.FormatBool(s.CurrentHasImagePointer),
+		strconv.FormatBool(s.CurrentAsyncPlaceholder),
+		strconv.Itoa(s.NodeCount),
+	}, "|")
+}
+
+func (s conversationPollSnapshot) LogFields(conversationID string) log.Fields {
+	return log.Fields{
+		"conversation_id":           conversationID,
+		"async_status":              s.AsyncStatus,
+		"current_node":              s.CurrentNode,
+		"current_role":              s.CurrentRole,
+		"current_content_type":      s.CurrentContentType,
+		"current_status":            s.CurrentStatus,
+		"current_recipient":         s.CurrentRecipient,
+		"current_channel":           s.CurrentChannel,
+		"current_has_image_pointer": s.CurrentHasImagePointer,
+		"current_async_placeholder": s.CurrentAsyncPlaceholder,
+		"node_count":                s.NodeCount,
+	}
 }

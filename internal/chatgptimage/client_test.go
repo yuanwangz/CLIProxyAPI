@@ -857,3 +857,43 @@ func TestShouldFallbackFromFConversation(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildConversationBodyUsesWebLikeGenerationDefaults(t *testing.T) {
+	client := &ChatGPTClient{}
+	body := client.buildConversationBody("draw a cat", "auto", "", "", nil)
+
+	if got := stringValue(body["model"]); got != "auto" {
+		t.Fatalf("model = %q, want auto", got)
+	}
+	if hints, ok := body["system_hints"].([]any); !ok || len(hints) != 0 {
+		t.Fatalf("system_hints = %#v, want empty array", body["system_hints"])
+	}
+	messageList, ok := body["messages"].([]any)
+	if !ok || len(messageList) != 1 {
+		t.Fatalf("messages = %#v, want one message", body["messages"])
+	}
+	message, ok := messageList[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message = %#v, want map", messageList[0])
+	}
+	metadata, ok := message["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata = %#v, want map", message["metadata"])
+	}
+	if repos, ok := metadata["selected_github_repos"].([]any); !ok || len(repos) != 0 {
+		t.Fatalf("selected_github_repos = %#v, want empty array", metadata["selected_github_repos"])
+	}
+	if selectedAll, ok := metadata["selected_all_github_repos"].(bool); !ok || selectedAll {
+		t.Fatalf("selected_all_github_repos = %#v, want false", metadata["selected_all_github_repos"])
+	}
+	if _, ok := message["create_time"].(float64); !ok {
+		t.Fatalf("create_time = %#v, want float64", message["create_time"])
+	}
+	clientInfo, ok := body["client_contextual_info"].(map[string]any)
+	if !ok {
+		t.Fatalf("client_contextual_info = %#v, want map", body["client_contextual_info"])
+	}
+	if got := stringValue(clientInfo["app_name"]); got != "chatgpt.com" {
+		t.Fatalf("app_name = %q, want chatgpt.com", got)
+	}
+}
