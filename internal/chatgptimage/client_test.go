@@ -393,6 +393,42 @@ func TestParseSSEAsyncPlaceholderPollsConversationWithoutWaitingForDone(t *testi
 	}
 }
 
+func TestParseSSEReturnsTerminalAssistantTextWithoutPolling(t *testing.T) {
+	client := &ChatGPTClient{
+		accessToken: "token",
+		oaiDeviceID: "device",
+		apiClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				t.Fatalf("unexpected conversation poll: %s %s", req.Method, req.URL.String())
+				return nil, nil
+			}),
+		},
+		pollInterval: time.Millisecond,
+		pollMaxWait:  time.Second,
+	}
+
+	stream := strings.Join([]string{
+		`data: {"conversation_id":"conv-refusal","message":{"id":"assistant-refusal","author":{"role":"assistant"},"status":"finished_successfully","content":{"content_type":"text","parts":["I can't help create that image."]}}}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	_, err := client.parseSSE(context.Background(), strings.NewReader(stream), conversationRequestContext{
+		ConversationID:     "conv-refusal",
+		SubmittedMessageID: "user-refusal",
+	})
+	if err == nil {
+		t.Fatal("expected terminal assistant text error, got nil")
+	}
+	if statusCode(err) != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 status, got %d (%v)", statusCode(err), err)
+	}
+	if !strings.Contains(err.Error(), "I can't help create that image.") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
 func TestFetchConversationImagesRestrictsToSubmittedBranch(t *testing.T) {
 	conversationJSON := `{
 		"mapping": {
@@ -998,7 +1034,6 @@ func TestConversationPollSnapshotPopulateCapturesTextPreview(t *testing.T) {
 	}
 	snapshot := conversationPollSnapshot{
 		CurrentNode: "assistant-1",
-		NodeCount:   1,
 	}
 
 	snapshot.Populate(map[string]conversationNode{
@@ -1042,8 +1077,7 @@ func TestConversationPollSnapshotPopulateCapturesTextPreview(t *testing.T) {
 	if !strings.HasSuffix(snapshot.CurrentTextPreview, "...") {
 		t.Fatalf("CurrentTextPreview = %q, want truncated suffix", snapshot.CurrentTextPreview)
 	}
-	summary := snapshot.Summary("conv-1")
-	if !strings.Contains(summary, `current_text_preview="policy policy`) {
-		t.Fatalf("Summary = %q, want current_text_preview", summary)
+	if !snapshot.IsTerminalAssistantTextResponse() {
+		t.Fatal("expected terminal assistant text response")
 	}
 }

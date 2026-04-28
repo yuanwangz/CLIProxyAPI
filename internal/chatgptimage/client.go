@@ -419,6 +419,7 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 		conversationID string
 		asyncMode      bool
 		images         []imageResult
+		terminalText   string
 	)
 
 	for scanner.Scan() {
@@ -446,16 +447,12 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 		}
 		if rawType, ok := raw["type"]; ok {
 			var eventType string
-			if json.Unmarshal(rawType, &eventType) == nil {
-				switch eventType {
-				case "message_stream_complete":
-					if asyncMode && conversationID != "" {
-						log.WithField("conversation_id", conversationID).Debug("chatgpt image: async message stream completed, polling conversation")
-						return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
-					}
-				case "server_ste_metadata":
-					logStreamToolMetadata(conversationID, raw["metadata"])
-				}
+			if json.Unmarshal(rawType, &eventType) == nil &&
+				eventType == "message_stream_complete" &&
+				asyncMode &&
+				conversationID != "" {
+				log.WithField("conversation_id", conversationID).Debug("chatgpt image: async message stream completed, polling conversation")
+				return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
 			}
 		}
 		if rawAS, ok := raw["async_status"]; ok {
@@ -480,15 +477,8 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 				log.WithField("conversation_id", conversationID).Debug("chatgpt image: async image placeholder received")
 			}
 		}
-		if isTerminalAssistantTextMessage(msg) {
-			preview := messageTextPreview(msg.Content.Parts)
-			if preview != "" {
-				log.WithField("conversation_id", conversationID).Infof(
-					"chatgpt image: stream returned terminal assistant text response conversation_id=%q preview=%q",
-					conversationID,
-					preview,
-				)
-			}
+		if isTerminalAssistantTextMessage(msg) && !asyncMode {
+			terminalText = messageTextPreview(msg.Content.Parts)
 		}
 		images = append(images, c.extractImages(ctx, msg, conversationID)...)
 	}
@@ -514,6 +504,12 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 	}
 	if asyncMode && conversationID != "" {
 		return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
+	}
+	if terminalText != "" {
+		return nil, &statusError{
+			statusCode: http.StatusUnprocessableEntity,
+			message:    terminalText,
+		}
 	}
 	if conversationID != "" {
 		log.WithField("conversation_id", conversationID).Debug("chatgpt image: stream ended without inline images, polling conversation for delayed image results")
@@ -596,7 +592,6 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 		rateLimitBudget = defaultPollRateLimitBudget
 	}
 	var rateLimitedSince time.Time
-	lastSnapshot := conversationPollSnapshot{}
 	for time.Now().Before(deadline) {
 		if err := waitForNextConversationPoll(ctx, deadline, pollDelay); err != nil {
 			return nil, err
@@ -610,11 +605,6 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 				}
 				pollDelay = nextConversationPollDelay(err, pollDelay)
 				if time.Since(rateLimitedSince) >= rateLimitBudget {
-					log.WithError(err).WithField("conversation_id", conversationID).Warnf(
-						"chatgpt image: conversation polling exceeded rate limit budget after %s%s",
-						rateLimitBudget,
-						lastSnapshot.suffixSummary(conversationID),
-					)
 					return nil, &statusError{
 						statusCode: http.StatusTooManyRequests,
 						message:    "chatgpt image conversation polling rate limited for too long",
@@ -624,47 +614,22 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 				log.WithError(err).WithFields(log.Fields{
 					"conversation_id": conversationID,
 					"next_delay":      pollDelay.String(),
-				}).Warnf(
-					"chatgpt image: conversation poll rate limited, backing off conversation_id=%q next_delay=%s%s",
-					conversationID,
-					pollDelay,
-					lastSnapshot.suffixSummary(conversationID),
-				)
+				}).Warn("chatgpt image: conversation poll rate limited, backing off")
 				continue
 			}
 			rateLimitedSince = time.Time{}
 			pollDelay = normalizedPollInterval(c.pollInterval)
-			log.WithError(err).WithField("conversation_id", conversationID).Warnf(
-				"chatgpt image: poll conversation failed conversation_id=%q%s",
-				conversationID,
-				lastSnapshot.suffixSummary(conversationID),
-			)
+			log.WithError(err).WithField("conversation_id", conversationID).Warn("chatgpt image: poll conversation failed")
 		} else if len(images) > 0 {
 			return images, nil
 		} else {
 			rateLimitedSince = time.Time{}
 			pollDelay = normalizedPollInterval(c.pollInterval)
-			if snapshot.Signature() != "" && snapshot.Signature() != lastSnapshot.Signature() {
-				log.WithFields(snapshot.LogFields(conversationID)).Infof(
-					"chatgpt image: conversation state updated without image output %s",
-					snapshot.Summary(conversationID),
-				)
-				lastSnapshot = snapshot
-			}
 			if snapshot.IsTerminalAssistantTextResponse() {
-				log.WithFields(snapshot.LogFields(conversationID)).Warnf(
-					"chatgpt image: conversation ended with terminal assistant text response %s",
-					snapshot.Summary(conversationID),
-				)
 				return nil, snapshot.TerminalTextError()
 			}
 		}
 	}
-	log.WithField("conversation_id", conversationID).Warnf(
-		"chatgpt image: timed out waiting for async image generation after %s%s",
-		maxWait,
-		lastSnapshot.suffixSummary(conversationID),
-	)
 	return nil, &statusError{statusCode: http.StatusGatewayTimeout, message: "timed out waiting for async image generation"}
 }
 
@@ -700,9 +665,7 @@ func (c *ChatGPTClient) fetchConversationImagesDetailed(ctx context.Context, con
 		seen   map[string]struct{}
 	)
 	snapshot := conversationPollSnapshot{
-		AsyncStatus: conv.AsyncStatus,
 		CurrentNode: strings.TrimSpace(conv.CurrentNode),
-		NodeCount:   len(conv.Mapping),
 	}
 	var visit func(string)
 	visit = func(nodeID string) {
@@ -1449,14 +1412,10 @@ type sseImagePart struct {
 }
 
 type conversationPollSnapshot struct {
-	AsyncStatus             int
 	CurrentNode             string
-	NodeCount               int
 	CurrentRole             string
 	CurrentContentType      string
 	CurrentStatus           string
-	CurrentRecipient        string
-	CurrentChannel          string
 	CurrentHasImagePointer  bool
 	CurrentAsyncPlaceholder bool
 	CurrentTextPreview      string
@@ -1493,8 +1452,6 @@ func (s *conversationPollSnapshot) Populate(mapping map[string]conversationNode)
 	s.CurrentRole = strings.TrimSpace(node.Message.Author.Role)
 	s.CurrentContentType = strings.TrimSpace(node.Message.Content.ContentType)
 	s.CurrentStatus = strings.TrimSpace(node.Message.Status)
-	s.CurrentRecipient = strings.TrimSpace(node.Message.Recipient)
-	s.CurrentChannel = strings.TrimSpace(node.Message.Channel)
 	s.CurrentAsyncPlaceholder = isAsyncImagePendingMessage(node.Message)
 	s.CurrentTextPreview = messageTextPreview(node.Message.Content.Parts)
 	for _, rawPart := range node.Message.Content.Parts {
@@ -1505,64 +1462,6 @@ func (s *conversationPollSnapshot) Populate(mapping map[string]conversationNode)
 			s.CurrentHasImagePointer = true
 			break
 		}
-	}
-}
-
-func (s conversationPollSnapshot) Signature() string {
-	return strings.Join([]string{
-		strconv.Itoa(s.AsyncStatus),
-		s.CurrentNode,
-		s.CurrentRole,
-		s.CurrentContentType,
-		s.CurrentStatus,
-		s.CurrentRecipient,
-		s.CurrentChannel,
-		strconv.FormatBool(s.CurrentHasImagePointer),
-		strconv.FormatBool(s.CurrentAsyncPlaceholder),
-		s.CurrentTextPreview,
-		strconv.Itoa(s.NodeCount),
-	}, "|")
-}
-
-func (s conversationPollSnapshot) Summary(conversationID string) string {
-	return fmt.Sprintf(
-		"conversation_id=%q async_status=%d current_node=%q current_role=%q current_content_type=%q current_status=%q current_recipient=%q current_channel=%q current_has_image_pointer=%t current_async_placeholder=%t current_text_preview=%q node_count=%d",
-		conversationID,
-		s.AsyncStatus,
-		s.CurrentNode,
-		s.CurrentRole,
-		s.CurrentContentType,
-		s.CurrentStatus,
-		s.CurrentRecipient,
-		s.CurrentChannel,
-		s.CurrentHasImagePointer,
-		s.CurrentAsyncPlaceholder,
-		s.CurrentTextPreview,
-		s.NodeCount,
-	)
-}
-
-func (s conversationPollSnapshot) suffixSummary(conversationID string) string {
-	if s.Signature() == "" {
-		return ""
-	}
-	return " last_state={" + s.Summary(conversationID) + "}"
-}
-
-func (s conversationPollSnapshot) LogFields(conversationID string) log.Fields {
-	return log.Fields{
-		"conversation_id":           conversationID,
-		"async_status":              s.AsyncStatus,
-		"current_node":              s.CurrentNode,
-		"current_role":              s.CurrentRole,
-		"current_content_type":      s.CurrentContentType,
-		"current_status":            s.CurrentStatus,
-		"current_recipient":         s.CurrentRecipient,
-		"current_channel":           s.CurrentChannel,
-		"current_has_image_pointer": s.CurrentHasImagePointer,
-		"current_async_placeholder": s.CurrentAsyncPlaceholder,
-		"current_text_preview":      s.CurrentTextPreview,
-		"node_count":                s.NodeCount,
 	}
 }
 
@@ -1636,31 +1535,4 @@ func isTerminalAssistantTextMessage(msg *sseMessage) bool {
 		strings.TrimSpace(msg.Content.ContentType) == "text" &&
 		strings.TrimSpace(msg.Status) == "finished_successfully" &&
 		!isAsyncImagePendingMessage(msg)
-}
-
-func logStreamToolMetadata(conversationID string, raw json.RawMessage) {
-	if len(raw) == 0 {
-		return
-	}
-	var payload struct {
-		ToolInvoked          bool   `json:"tool_invoked"`
-		ToolName             string `json:"tool_name"`
-		TurnUseCase          string `json:"turn_use_case"`
-		ModelSlug            string `json:"model_slug"`
-		StreamingAsyncStatus bool   `json:"streaming_async_status"`
-		ReplaceStreamStatus  bool   `json:"replace_stream_status"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return
-	}
-	log.WithField("conversation_id", conversationID).Infof(
-		"chatgpt image: stream metadata conversation_id=%q tool_invoked=%t tool_name=%q turn_use_case=%q model_slug=%q streaming_async_status=%t replace_stream_status=%t",
-		conversationID,
-		payload.ToolInvoked,
-		strings.TrimSpace(payload.ToolName),
-		strings.TrimSpace(payload.TurnUseCase),
-		strings.TrimSpace(payload.ModelSlug),
-		payload.StreamingAsyncStatus,
-		payload.ReplaceStreamStatus,
-	)
 }
