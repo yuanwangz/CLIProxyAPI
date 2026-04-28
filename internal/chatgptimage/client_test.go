@@ -934,3 +934,61 @@ func TestBuildConversationBodyUsesWebLikeGenerationDefaults(t *testing.T) {
 		t.Fatalf("app_name = %q, want chatgpt.com", got)
 	}
 }
+
+func TestConversationPollSnapshotPopulateCapturesTextPreview(t *testing.T) {
+	longText := strings.Repeat("policy ", 40) + "\n\nPlease change the prompt."
+	rawText, err := json.Marshal(longText)
+	if err != nil {
+		t.Fatalf("marshal longText: %v", err)
+	}
+	snapshot := conversationPollSnapshot{
+		CurrentNode: "assistant-1",
+		NodeCount:   1,
+	}
+
+	snapshot.Populate(map[string]conversationNode{
+		"assistant-1": {
+			Message: &sseMessage{
+				Status:    "finished_successfully",
+				Recipient: "all",
+				Author: struct {
+					Role string `json:"role"`
+				}{
+					Role: "assistant",
+				},
+				Content: struct {
+					ContentType string            `json:"content_type"`
+					Parts       []json.RawMessage `json:"parts"`
+				}{
+					ContentType: "text",
+					Parts: []json.RawMessage{
+						rawText,
+					},
+				},
+			},
+		},
+	})
+
+	if snapshot.CurrentRole != "assistant" {
+		t.Fatalf("CurrentRole = %q, want assistant", snapshot.CurrentRole)
+	}
+	if snapshot.CurrentContentType != "text" {
+		t.Fatalf("CurrentContentType = %q, want text", snapshot.CurrentContentType)
+	}
+	if snapshot.CurrentTextPreview == "" {
+		t.Fatal("CurrentTextPreview is empty")
+	}
+	if strings.Contains(snapshot.CurrentTextPreview, "\n") {
+		t.Fatalf("CurrentTextPreview contains newline: %q", snapshot.CurrentTextPreview)
+	}
+	if len([]rune(snapshot.CurrentTextPreview)) > 200 {
+		t.Fatalf("CurrentTextPreview length = %d, want <= 200", len([]rune(snapshot.CurrentTextPreview)))
+	}
+	if !strings.HasSuffix(snapshot.CurrentTextPreview, "...") {
+		t.Fatalf("CurrentTextPreview = %q, want truncated suffix", snapshot.CurrentTextPreview)
+	}
+	summary := snapshot.Summary("conv-1")
+	if !strings.Contains(summary, `current_text_preview="policy policy`) {
+		t.Fatalf("Summary = %q, want current_text_preview", summary)
+	}
+}

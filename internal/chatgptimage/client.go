@@ -1438,6 +1438,7 @@ type conversationPollSnapshot struct {
 	CurrentChannel          string
 	CurrentHasImagePointer  bool
 	CurrentAsyncPlaceholder bool
+	CurrentTextPreview      string
 }
 
 func (s *conversationPollSnapshot) Populate(mapping map[string]conversationNode) {
@@ -1454,6 +1455,7 @@ func (s *conversationPollSnapshot) Populate(mapping map[string]conversationNode)
 	s.CurrentRecipient = strings.TrimSpace(node.Message.Recipient)
 	s.CurrentChannel = strings.TrimSpace(node.Message.Channel)
 	s.CurrentAsyncPlaceholder = isAsyncImagePendingMessage(node.Message)
+	s.CurrentTextPreview = messageTextPreview(node.Message.Content.Parts)
 	for _, rawPart := range node.Message.Content.Parts {
 		var part sseImagePart
 		if err := json.Unmarshal(rawPart, &part); err == nil &&
@@ -1476,13 +1478,14 @@ func (s conversationPollSnapshot) Signature() string {
 		s.CurrentChannel,
 		strconv.FormatBool(s.CurrentHasImagePointer),
 		strconv.FormatBool(s.CurrentAsyncPlaceholder),
+		s.CurrentTextPreview,
 		strconv.Itoa(s.NodeCount),
 	}, "|")
 }
 
 func (s conversationPollSnapshot) Summary(conversationID string) string {
 	return fmt.Sprintf(
-		"conversation_id=%q async_status=%d current_node=%q current_role=%q current_content_type=%q current_status=%q current_recipient=%q current_channel=%q current_has_image_pointer=%t current_async_placeholder=%t node_count=%d",
+		"conversation_id=%q async_status=%d current_node=%q current_role=%q current_content_type=%q current_status=%q current_recipient=%q current_channel=%q current_has_image_pointer=%t current_async_placeholder=%t current_text_preview=%q node_count=%d",
 		conversationID,
 		s.AsyncStatus,
 		s.CurrentNode,
@@ -1493,6 +1496,7 @@ func (s conversationPollSnapshot) Summary(conversationID string) string {
 		s.CurrentChannel,
 		s.CurrentHasImagePointer,
 		s.CurrentAsyncPlaceholder,
+		s.CurrentTextPreview,
 		s.NodeCount,
 	)
 }
@@ -1516,6 +1520,69 @@ func (s conversationPollSnapshot) LogFields(conversationID string) log.Fields {
 		"current_channel":           s.CurrentChannel,
 		"current_has_image_pointer": s.CurrentHasImagePointer,
 		"current_async_placeholder": s.CurrentAsyncPlaceholder,
+		"current_text_preview":      s.CurrentTextPreview,
 		"node_count":                s.NodeCount,
 	}
+}
+
+func messageTextPreview(parts []json.RawMessage) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	values := make([]string, 0, len(parts))
+	for _, rawPart := range parts {
+		text := rawMessageText(rawPart)
+		if text == "" {
+			continue
+		}
+		values = append(values, text)
+	}
+	return summarizeLogText(strings.Join(values, " "), 200)
+}
+
+func rawMessageText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return normalizeLogText(text)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	for _, key := range []string{"text", "title", "caption"} {
+		value, ok := payload[key]
+		if !ok {
+			continue
+		}
+		var text string
+		if err := json.Unmarshal(value, &text); err == nil {
+			return normalizeLogText(text)
+		}
+	}
+	return ""
+}
+
+func normalizeLogText(text string) string {
+	if text == "" {
+		return ""
+	}
+	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+}
+
+func summarizeLogText(text string, maxLen int) string {
+	text = normalizeLogText(text)
+	if text == "" || maxLen <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= maxLen {
+		return text
+	}
+	if maxLen <= 3 {
+		return string(runes[:maxLen])
+	}
+	return string(runes[:maxLen-3]) + "..."
 }
