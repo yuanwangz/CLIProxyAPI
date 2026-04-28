@@ -715,6 +715,61 @@ func TestPollForImagesStopsAfterRateLimitBudget(t *testing.T) {
 	}
 }
 
+func TestPollForImagesReturnsTerminalAssistantTextResponse(t *testing.T) {
+	client := &ChatGPTClient{
+		accessToken:         "token",
+		oaiDeviceID:         "device",
+		pollInterval:        time.Millisecond,
+		pollMaxWait:         time.Second,
+		pollRateLimitBudget: time.Second,
+		apiClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodGet || !strings.HasSuffix(req.URL.Path, "/conversation/conv-refusal") {
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body: io.NopCloser(strings.NewReader(`{
+						"current_node": "assistant-1",
+						"mapping": {
+							"user-1": {
+								"message": {
+									"id": "user-1",
+									"author": {"role": "user"},
+									"status": "finished_successfully",
+									"content": {"content_type": "text", "parts": ["prompt"]}
+								},
+								"children": ["assistant-1"]
+							},
+							"assistant-1": {
+								"message": {
+									"id": "assistant-1",
+									"author": {"role": "assistant"},
+									"status": "finished_successfully",
+									"recipient": "all",
+									"content": {"content_type": "text", "parts": ["I can’t help create sexualized livestream imagery."]}
+								}
+							}
+						}
+					}`)),
+				}, nil
+			}),
+		},
+	}
+
+	_, err := client.pollForImages(context.Background(), "conv-refusal", "user-1")
+	if err == nil {
+		t.Fatal("expected terminal assistant text error, got nil")
+	}
+	if statusCode(err) != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 status, got %d (%v)", statusCode(err), err)
+	}
+	if !strings.Contains(err.Error(), "sexualized livestream imagery") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
 func TestGenerateImagePrefersFConversation(t *testing.T) {
 	var requestBody map[string]any
 	client := &ChatGPTClient{

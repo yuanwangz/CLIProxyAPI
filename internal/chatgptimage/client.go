@@ -446,12 +446,16 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 		}
 		if rawType, ok := raw["type"]; ok {
 			var eventType string
-			if json.Unmarshal(rawType, &eventType) == nil &&
-				eventType == "message_stream_complete" &&
-				asyncMode &&
-				conversationID != "" {
-				log.WithField("conversation_id", conversationID).Debug("chatgpt image: async message stream completed, polling conversation")
-				return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
+			if json.Unmarshal(rawType, &eventType) == nil {
+				switch eventType {
+				case "message_stream_complete":
+					if asyncMode && conversationID != "" {
+						log.WithField("conversation_id", conversationID).Debug("chatgpt image: async message stream completed, polling conversation")
+						return c.pollForImages(ctx, conversationID, requestContext.SubmittedMessageID)
+					}
+				case "server_ste_metadata":
+					logStreamToolMetadata(conversationID, raw["metadata"])
+				}
 			}
 		}
 		if rawAS, ok := raw["async_status"]; ok {
@@ -474,6 +478,16 @@ func (c *ChatGPTClient) parseSSE(ctx context.Context, reader io.Reader, requestC
 			asyncMode = true
 			if conversationID != "" {
 				log.WithField("conversation_id", conversationID).Debug("chatgpt image: async image placeholder received")
+			}
+		}
+		if isTerminalAssistantTextMessage(msg) {
+			preview := messageTextPreview(msg.Content.Parts)
+			if preview != "" {
+				log.WithField("conversation_id", conversationID).Infof(
+					"chatgpt image: stream returned terminal assistant text response conversation_id=%q preview=%q",
+					conversationID,
+					preview,
+				)
 			}
 		}
 		images = append(images, c.extractImages(ctx, msg, conversationID)...)
@@ -636,6 +650,13 @@ func (c *ChatGPTClient) pollForImagesWithWait(ctx context.Context, conversationI
 					snapshot.Summary(conversationID),
 				)
 				lastSnapshot = snapshot
+			}
+			if snapshot.IsTerminalAssistantTextResponse() {
+				log.WithFields(snapshot.LogFields(conversationID)).Warnf(
+					"chatgpt image: conversation ended with terminal assistant text response %s",
+					snapshot.Summary(conversationID),
+				)
+				return nil, snapshot.TerminalTextError()
 			}
 		}
 	}
@@ -1441,6 +1462,26 @@ type conversationPollSnapshot struct {
 	CurrentTextPreview      string
 }
 
+func (s conversationPollSnapshot) IsTerminalAssistantTextResponse() bool {
+	return s.CurrentRole == "assistant" &&
+		s.CurrentContentType == "text" &&
+		s.CurrentStatus == "finished_successfully" &&
+		!s.CurrentHasImagePointer &&
+		!s.CurrentAsyncPlaceholder &&
+		s.CurrentTextPreview != ""
+}
+
+func (s conversationPollSnapshot) TerminalTextError() error {
+	message := strings.TrimSpace(s.CurrentTextPreview)
+	if message == "" {
+		message = "chatgpt image request returned a text response instead of an image"
+	}
+	return &statusError{
+		statusCode: http.StatusUnprocessableEntity,
+		message:    message,
+	}
+}
+
 func (s *conversationPollSnapshot) Populate(mapping map[string]conversationNode) {
 	if s == nil || len(mapping) == 0 {
 		return
@@ -1585,4 +1626,41 @@ func summarizeLogText(text string, maxLen int) string {
 		return string(runes[:maxLen])
 	}
 	return string(runes[:maxLen-3]) + "..."
+}
+
+func isTerminalAssistantTextMessage(msg *sseMessage) bool {
+	if msg == nil {
+		return false
+	}
+	return strings.TrimSpace(msg.Author.Role) == "assistant" &&
+		strings.TrimSpace(msg.Content.ContentType) == "text" &&
+		strings.TrimSpace(msg.Status) == "finished_successfully" &&
+		!isAsyncImagePendingMessage(msg)
+}
+
+func logStreamToolMetadata(conversationID string, raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	var payload struct {
+		ToolInvoked          bool   `json:"tool_invoked"`
+		ToolName             string `json:"tool_name"`
+		TurnUseCase          string `json:"turn_use_case"`
+		ModelSlug            string `json:"model_slug"`
+		StreamingAsyncStatus bool   `json:"streaming_async_status"`
+		ReplaceStreamStatus  bool   `json:"replace_stream_status"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return
+	}
+	log.WithField("conversation_id", conversationID).Infof(
+		"chatgpt image: stream metadata conversation_id=%q tool_invoked=%t tool_name=%q turn_use_case=%q model_slug=%q streaming_async_status=%t replace_stream_status=%t",
+		conversationID,
+		payload.ToolInvoked,
+		strings.TrimSpace(payload.ToolName),
+		strings.TrimSpace(payload.TurnUseCase),
+		strings.TrimSpace(payload.ModelSlug),
+		payload.StreamingAsyncStatus,
+		payload.ReplaceStreamStatus,
+	)
 }
