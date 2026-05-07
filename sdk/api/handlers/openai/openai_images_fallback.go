@@ -158,7 +158,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 				"error":   errorString(errMsg),
 			}).Warn("openai images: primary responses path failed, switching to codex oauth fallback")
 			stopFallbackKeepAlive := startImageFallbackJSONKeepAlive(c, cliCtx)
-			fallbackOut, fallbackErr := h.executeImageFallbackAsJSON(cliCtx, selectedAuth.Get(), responseFormat, fallbackReq)
+			fallbackOut, fallbackErr := h.executeImageFallbackAsJSON(cliCtx, selectedAuth.Set, responseFormat, fallbackReq)
 			stopFallbackKeepAlive()
 			if fallbackErr != nil {
 				h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, true)
@@ -294,7 +294,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponsesWithFallback(c *gin.Context,
 					"status":  errMsg.StatusCode,
 					"error":   errorString(errMsg),
 				}).Warn("openai images: primary responses stream failed, switching to codex oauth fallback")
-				fallbackErr := h.writeImageFallbackStream(cliCtx, selectedAuth.Get(), responseFormat, streamPrefix, fallbackReq, setSSEHeaders, writeEvent)
+				fallbackErr := h.writeImageFallbackStream(cliCtx, selectedAuth.Set, responseFormat, streamPrefix, fallbackReq, setSSEHeaders, writeEvent)
 				if fallbackErr != nil {
 					h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, true)
 					log.WithFields(log.Fields{
@@ -350,9 +350,9 @@ func (h *OpenAIAPIHandler) shouldUseImageFallback(errMsg *interfaces.ErrorMessag
 	return imagesfallback.ShouldUseCodexOAuthFallback(errMsg.StatusCode, errMsg.Error, auth)
 }
 
-func (h *OpenAIAPIHandler) executeImageFallback(ctx context.Context, authID string, fallbackReq imagesfallback.Request) (*imagesfallback.Result, *interfaces.ErrorMessage) {
+func (h *OpenAIAPIHandler) executeImageFallback(ctx context.Context, selectedCallback func(string), fallbackReq imagesfallback.Request) (*imagesfallback.Result, *interfaces.ErrorMessage) {
 	service := imagesfallback.NewService(h.Cfg, h.AuthManager)
-	result, err := service.Execute(ctx, authID, fallbackReq)
+	result, err := service.ExecuteWithAuthManager(ctx, fallbackReq, selectedCallback)
 	if err == nil {
 		return result, nil
 	}
@@ -367,16 +367,16 @@ func (h *OpenAIAPIHandler) executeImageFallback(ctx context.Context, authID stri
 	}
 }
 
-func (h *OpenAIAPIHandler) executeImageFallbackAsJSON(ctx context.Context, authID string, responseFormat string, fallbackReq imagesfallback.Request) ([]byte, *interfaces.ErrorMessage) {
-	result, errMsg := h.executeImageFallback(ctx, authID, fallbackReq)
+func (h *OpenAIAPIHandler) executeImageFallbackAsJSON(ctx context.Context, selectedCallback func(string), responseFormat string, fallbackReq imagesfallback.Request) ([]byte, *interfaces.ErrorMessage) {
+	result, errMsg := h.executeImageFallback(ctx, selectedCallback, fallbackReq)
 	if errMsg != nil {
 		return nil, errMsg
 	}
 	return buildFallbackImagesAPIResponse(result, responseFormat)
 }
 
-func (h *OpenAIAPIHandler) writeImageFallbackStream(ctx context.Context, authID string, responseFormat string, streamPrefix string, fallbackReq imagesfallback.Request, setSSEHeaders func(), writeEvent func(string, []byte)) *interfaces.ErrorMessage {
-	result, errMsg := h.executeImageFallback(ctx, authID, fallbackReq)
+func (h *OpenAIAPIHandler) writeImageFallbackStream(ctx context.Context, selectedCallback func(string), responseFormat string, streamPrefix string, fallbackReq imagesfallback.Request, setSSEHeaders func(), writeEvent func(string, []byte)) *interfaces.ErrorMessage {
+	result, errMsg := h.executeImageFallback(ctx, selectedCallback, fallbackReq)
 	if errMsg != nil {
 		return errMsg
 	}
