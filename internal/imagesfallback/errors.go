@@ -117,6 +117,7 @@ func IsImageQuotaExceededError(err error) bool {
 		return false
 	}
 	return strings.Contains(text, "free plan limit for image generations") ||
+		strings.Contains(text, "free plan limit for image generation") ||
 		strings.Contains(text, "image generation limit") ||
 		(strings.Contains(text, "image") && strings.Contains(text, "quota")) ||
 		(strings.Contains(text, "image") && strings.Contains(text, "rate limit"))
