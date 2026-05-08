@@ -111,8 +111,18 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
 	legacyRR := httptest.NewRecorder()
 	server.engine.ServeHTTP(legacyRR, legacyReq)
-	if legacyRR.Code != http.StatusNotFound {
-		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusNotFound, legacyRR.Body.String())
+	if legacyRR.Code != http.StatusOK {
+		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusOK, legacyRR.Body.String())
+	}
+	var legacyPayload struct {
+		TotalRequests int64          `json:"total_requests"`
+		APIs          map[string]any `json:"apis"`
+	}
+	if errUnmarshal := json.Unmarshal(legacyRR.Body.Bytes(), &legacyPayload); errUnmarshal != nil {
+		t.Fatalf("unmarshal legacy usage payload: %v body=%s", errUnmarshal, legacyRR.Body.String())
+	}
+	if legacyPayload.TotalRequests != 0 || len(legacyPayload.APIs) != 0 {
+		t.Fatalf("legacy usage payload = %+v, want empty aggregate", legacyPayload)
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
