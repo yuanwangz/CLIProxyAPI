@@ -27,6 +27,7 @@ import (
 const (
 	defaultQueryLimit = 50000
 	queueSize         = 2048
+	cooldownQueueSize = 1024
 )
 
 type Store struct {
@@ -36,6 +37,20 @@ type Store struct {
 type Plugin struct {
 	ch   chan event
 	stop chan struct{}
+}
+
+type CooldownState struct {
+	AuthID         string
+	AuthIndex      string
+	Provider       string
+	Model          string
+	Reason         string
+	StatusMessage  string
+	HTTPStatus     int
+	NextRetryAfter time.Time
+	QuotaExceeded  bool
+	BackoffLevel   int
+	UpdatedAt      time.Time
 }
 
 type Event struct {
@@ -115,9 +130,18 @@ var (
 	defaultMu    sync.RWMutex
 	defaultStore *Store
 	pluginOnce   sync.Once
+	cooldownOnce sync.Once
+	cooldownCh   chan cooldownCommand
 
 	errUnsupportedImportEvent = errors.New("unsupported usage import event")
 )
+
+type cooldownCommand struct {
+	action string
+	state  CooldownState
+	authID string
+	model  string
+}
 
 func DefaultDBPath(wd string, writableBase string) string {
 	if trimmed := strings.TrimSpace(writableBase); trimmed != "" {
@@ -154,6 +178,10 @@ func Init(path string, initiallyEnabled bool) error {
 		}
 		go plugin.run()
 		coreusage.RegisterPlugin(plugin)
+	})
+	cooldownOnce.Do(func() {
+		cooldownCh = make(chan cooldownCommand, cooldownQueueSize)
+		go runCooldownCommands()
 	})
 	return nil
 }
@@ -227,6 +255,22 @@ func (s *Store) init() error {
 		`create index if not exists idx_usage_events_model on usage_events(model)`,
 		`create index if not exists idx_usage_events_auth_index on usage_events(auth_index)`,
 		`create index if not exists idx_usage_events_endpoint on usage_events(endpoint)`,
+		`create table if not exists auth_cooldowns (
+			auth_id text not null,
+			auth_index text,
+			provider text,
+			model text not null,
+			reason text,
+			status_message text,
+			http_status integer not null default 0,
+			next_retry_after_ms integer not null,
+			quota_exceeded integer not null default 0,
+			backoff_level integer not null default 0,
+			updated_at_ms integer not null,
+			primary key(auth_id, model)
+		)`,
+		`create index if not exists idx_auth_cooldowns_auth_index on auth_cooldowns(auth_index)`,
+		`create index if not exists idx_auth_cooldowns_next_retry on auth_cooldowns(next_retry_after_ms)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
@@ -262,6 +306,58 @@ func (p *Plugin) run() {
 				log.WithError(err).Warn("failed to persist usage event")
 			}
 		}
+	}
+}
+
+func runCooldownCommands() {
+	for command := range cooldownCh {
+		store := DefaultStore()
+		if store == nil {
+			continue
+		}
+		ctx := context.Background()
+		var err error
+		switch command.action {
+		case "upsert":
+			err = store.UpsertCooldown(ctx, command.state)
+		case "delete":
+			err = store.DeleteCooldown(ctx, command.authID, command.model)
+		case "delete-auth":
+			err = store.DeleteAuthCooldowns(ctx, command.authID)
+		}
+		if err != nil {
+			log.WithError(err).Warn("failed to update persisted auth cooldown")
+		}
+	}
+}
+
+func PersistCooldownAsync(state CooldownState) {
+	enqueueCooldownCommand(cooldownCommand{action: "upsert", state: state})
+}
+
+func ClearCooldownAsync(authID, model string) {
+	enqueueCooldownCommand(cooldownCommand{
+		action: "delete",
+		authID: strings.TrimSpace(authID),
+		model:  strings.TrimSpace(model),
+	})
+}
+
+func ClearAuthCooldownsAsync(authID string) {
+	enqueueCooldownCommand(cooldownCommand{
+		action: "delete-auth",
+		authID: strings.TrimSpace(authID),
+	})
+}
+
+func enqueueCooldownCommand(command cooldownCommand) {
+	if cooldownCh == nil {
+		return
+	}
+	select {
+	case cooldownCh <- command:
+	default:
+		log.Warn("auth cooldown persistence queue is full; dropping cooldown update")
 	}
 }
 
@@ -481,6 +577,136 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+func ActiveCooldownsByAuth(ctx context.Context, authID string, now time.Time) ([]CooldownState, error) {
+	store := DefaultStore()
+	if store == nil {
+		return nil, nil
+	}
+	return store.ActiveCooldownsByAuth(ctx, authID, now)
+}
+
+func (s *Store) UpsertCooldown(ctx context.Context, state CooldownState) error {
+	if s == nil || s.db == nil {
+		return errors.New("usage store is closed")
+	}
+	state = normalizeCooldownState(state)
+	if strings.TrimSpace(state.AuthID) == "" {
+		return errors.New("auth cooldown auth_id is empty")
+	}
+	if state.NextRetryAfter.IsZero() {
+		return s.DeleteCooldown(ctx, state.AuthID, state.Model)
+	}
+	if !state.NextRetryAfter.After(time.Now()) {
+		return s.DeleteCooldown(ctx, state.AuthID, state.Model)
+	}
+	_, err := s.db.ExecContext(ctx, `insert into auth_cooldowns (
+		auth_id, auth_index, provider, model, reason, status_message, http_status,
+		next_retry_after_ms, quota_exceeded, backoff_level, updated_at_ms
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	on conflict(auth_id, model) do update set
+		auth_index = excluded.auth_index,
+		provider = excluded.provider,
+		reason = excluded.reason,
+		status_message = excluded.status_message,
+		http_status = excluded.http_status,
+		next_retry_after_ms = excluded.next_retry_after_ms,
+		quota_exceeded = excluded.quota_exceeded,
+		backoff_level = excluded.backoff_level,
+		updated_at_ms = excluded.updated_at_ms`,
+		state.AuthID,
+		state.AuthIndex,
+		state.Provider,
+		state.Model,
+		state.Reason,
+		state.StatusMessage,
+		state.HTTPStatus,
+		state.NextRetryAfter.UnixMilli(),
+		boolToInt(state.QuotaExceeded),
+		state.BackoffLevel,
+		state.UpdatedAt.UnixMilli(),
+	)
+	return err
+}
+
+func (s *Store) DeleteCooldown(ctx context.Context, authID, model string) error {
+	if s == nil || s.db == nil {
+		return errors.New("usage store is closed")
+	}
+	authID = strings.TrimSpace(authID)
+	model = strings.TrimSpace(model)
+	if authID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `delete from auth_cooldowns where auth_id = ? and model = ?`, authID, model)
+	return err
+}
+
+func (s *Store) DeleteAuthCooldowns(ctx context.Context, authID string) error {
+	if s == nil || s.db == nil {
+		return errors.New("usage store is closed")
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `delete from auth_cooldowns where auth_id = ?`, authID)
+	return err
+}
+
+func (s *Store) ActiveCooldownsByAuth(ctx context.Context, authID string, now time.Time) ([]CooldownState, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("usage store is closed")
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil, nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if _, err := s.db.ExecContext(ctx, `delete from auth_cooldowns where next_retry_after_ms <= ?`, now.UnixMilli()); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `select
+		auth_id, auth_index, provider, model, reason, status_message, http_status,
+		next_retry_after_ms, quota_exceeded, backoff_level, updated_at_ms
+		from auth_cooldowns
+		where auth_id = ? and next_retry_after_ms > ?
+		order by next_retry_after_ms desc`, authID, now.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]CooldownState, 0)
+	for rows.Next() {
+		var state CooldownState
+		var nextRetryAfterMS int64
+		var updatedAtMS int64
+		var quotaExceeded int
+		if err := rows.Scan(
+			&state.AuthID,
+			&state.AuthIndex,
+			&state.Provider,
+			&state.Model,
+			&state.Reason,
+			&state.StatusMessage,
+			&state.HTTPStatus,
+			&nextRetryAfterMS,
+			&quotaExceeded,
+			&state.BackoffLevel,
+			&updatedAtMS,
+		); err != nil {
+			return nil, err
+		}
+		state.NextRetryAfter = time.UnixMilli(nextRetryAfterMS).UTC()
+		state.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
+		state.QuotaExceeded = quotaExceeded != 0
+		out = append(out, normalizeCooldownState(state))
+	}
+	return out, rows.Err()
 }
 
 func BuildPayload(events []Event) Payload {
@@ -715,6 +941,31 @@ func normalizeEvent(event Event) Event {
 		event.EventHash = buildEventHash(event)
 	}
 	return event
+}
+
+func normalizeCooldownState(state CooldownState) CooldownState {
+	state.AuthID = strings.TrimSpace(state.AuthID)
+	state.AuthIndex = strings.TrimSpace(state.AuthIndex)
+	state.Provider = strings.TrimSpace(state.Provider)
+	state.Model = strings.TrimSpace(state.Model)
+	state.Reason = strings.TrimSpace(state.Reason)
+	state.StatusMessage = strings.TrimSpace(state.StatusMessage)
+	if state.NextRetryAfter.IsZero() {
+		return state
+	}
+	state.NextRetryAfter = state.NextRetryAfter.UTC()
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now().UTC()
+	} else {
+		state.UpdatedAt = state.UpdatedAt.UTC()
+	}
+	if state.HTTPStatus < 0 {
+		state.HTTPStatus = 0
+	}
+	if state.BackoffLevel < 0 {
+		state.BackoffLevel = 0
+	}
+	return state
 }
 
 func normalizeTokens(detail coreusage.Detail) Tokens {

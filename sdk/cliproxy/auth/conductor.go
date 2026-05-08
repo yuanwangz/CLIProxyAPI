@@ -2054,6 +2054,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
+	var cooldownUpdate cooldownPersistenceUpdate
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -2179,6 +2180,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 
 		_ = m.persist(ctx, auth)
+		cooldownUpdate = buildCooldownPersistenceUpdate(auth, result, now)
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
@@ -2198,6 +2200,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
+	cooldownUpdate.apply()
 	m.hook.OnResult(ctx, result)
 }
 

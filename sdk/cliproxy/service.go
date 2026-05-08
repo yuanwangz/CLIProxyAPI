@@ -312,6 +312,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// is already effective at this point.
 	s.registerModelsForAuth(auth)
 	s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
+	s.coreManager.RestorePersistedCooldowns(ctx, auth.ID)
 
 	// Refresh the scheduler entry so that the auth's supportedModelSet is rebuilt
 	// from the now-populated global model registry. Without this, newly added auths
@@ -1047,6 +1048,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	}
 	s.registerModelsForAuth(current)
 	s.coreManager.ReconcileRegistryModelStates(context.Background(), current.ID)
+	s.coreManager.RestorePersistedCooldowns(context.Background(), current.ID)
 
 	latest, ok := s.latestAuthForModelRegistration(current.ID)
 	if !ok || latest.Disabled {
@@ -1061,6 +1063,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	s.ensureExecutorsForAuth(latest)
 	s.registerModelsForAuth(latest)
 	s.coreManager.ReconcileRegistryModelStates(context.Background(), latest.ID)
+	s.coreManager.RestorePersistedCooldowns(context.Background(), latest.ID)
 	s.coreManager.RefreshSchedulerEntry(current.ID)
 	return true
 }
