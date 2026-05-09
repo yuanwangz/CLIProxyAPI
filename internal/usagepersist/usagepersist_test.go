@@ -49,6 +49,12 @@ func TestBuildEventNormalizesUsageRecord(t *testing.T) {
 	if event.Source != "per***@example.com" {
 		t.Fatalf("source = %q, want masked email", event.Source)
 	}
+	if event.SourceFull != "person@example.com" {
+		t.Fatalf("source full = %q, want full email", event.SourceFull)
+	}
+	if event.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status code = %d, want %d", event.StatusCode, http.StatusInternalServerError)
+	}
 	if event.SourceHash == "" || event.APIKeyHash == "" || event.EventHash == "" {
 		t.Fatalf("hash fields must be populated: source=%q api=%q event=%q", event.SourceHash, event.APIKeyHash, event.EventHash)
 	}
@@ -78,6 +84,8 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 			Endpoint:     "POST /v1/chat/completions",
 			Model:        "gpt-5",
 			Source:       "local",
+			SourceFull:   "local-full",
+			APIKeyHash:   "client-key-hash",
 			AuthIndex:    "account-1",
 			InputTokens:  1,
 			OutputTokens: 2,
@@ -90,9 +98,12 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 			Endpoint:     "POST /v1/chat/completions",
 			Model:        "gpt-5",
 			Source:       "local",
+			SourceFull:   "local-full",
+			APIKeyHash:   "client-key-hash",
 			OutputTokens: 4,
 			TotalTokens:  4,
 			Failed:       true,
+			StatusCode:   http.StatusTooManyRequests,
 		},
 	})
 	if err != nil {
@@ -109,6 +120,8 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 			Endpoint:     "POST /v1/chat/completions",
 			Model:        "gpt-5",
 			Source:       "local",
+			SourceFull:   "local-full",
+			APIKeyHash:   "client-key-hash",
 			AuthIndex:    "account-1",
 			InputTokens:  1,
 			OutputTokens: 2,
@@ -134,6 +147,10 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 	apiEntry := payload.APIs["POST /v1/chat/completions"]
 	if apiEntry == nil || apiEntry.Models["gpt-5"] == nil || len(apiEntry.Models["gpt-5"].Details) != 2 {
 		t.Fatalf("payload api entry = %+v", apiEntry)
+	}
+	detail := apiEntry.Models["gpt-5"].Details[0]
+	if detail.SourceFull != "local-full" || detail.APIKeyHash != "client-key-hash" || detail.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("payload detail did not preserve extended fields: %+v", detail)
 	}
 
 	exported, err := store.ExportJSONL(ctx)

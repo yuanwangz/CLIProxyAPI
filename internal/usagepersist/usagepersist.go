@@ -66,6 +66,7 @@ type Event struct {
 	AuthType        string `json:"auth_type,omitempty"`
 	AuthIndex       string `json:"auth_index,omitempty"`
 	Source          string `json:"source,omitempty"`
+	SourceFull      string `json:"source_full,omitempty"`
 	SourceHash      string `json:"source_hash,omitempty"`
 	APIKeyHash      string `json:"api_key_hash,omitempty"`
 	InputTokens     int64  `json:"input_tokens"`
@@ -76,6 +77,7 @@ type Event struct {
 	TotalTokens     int64  `json:"total_tokens"`
 	LatencyMS       *int64 `json:"latency_ms,omitempty"`
 	Failed          bool   `json:"failed"`
+	StatusCode      int    `json:"status_code,omitempty"`
 	RawJSON         string `json:"raw_json,omitempty"`
 	CreatedAtMS     int64  `json:"created_at_ms"`
 }
@@ -92,12 +94,16 @@ type Tokens struct {
 }
 
 type Detail struct {
-	Timestamp string `json:"timestamp"`
-	Source    string `json:"source"`
-	AuthIndex string `json:"auth_index,omitempty"`
-	LatencyMS *int64 `json:"latency_ms,omitempty"`
-	Tokens    Tokens `json:"tokens"`
-	Failed    bool   `json:"failed"`
+	Timestamp  string `json:"timestamp"`
+	Source     string `json:"source"`
+	SourceFull string `json:"source_full,omitempty"`
+	SourceHash string `json:"source_hash,omitempty"`
+	APIKeyHash string `json:"api_key_hash,omitempty"`
+	AuthIndex  string `json:"auth_index,omitempty"`
+	LatencyMS  *int64 `json:"latency_ms,omitempty"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Tokens     Tokens `json:"tokens"`
+	Failed     bool   `json:"failed"`
 }
 
 type ModelAggregate struct {
@@ -237,6 +243,7 @@ func (s *Store) init() error {
 			auth_type text,
 			auth_index text,
 			source text,
+			source_full text,
 			source_hash text,
 			api_key_hash text,
 			input_tokens integer not null default 0,
@@ -247,6 +254,7 @@ func (s *Store) init() error {
 			total_tokens integer not null default 0,
 			latency_ms integer,
 			failed integer not null default 0,
+			status_code integer not null default 0,
 			raw_json text,
 			created_at_ms integer not null
 		)`,
@@ -255,6 +263,7 @@ func (s *Store) init() error {
 		`create index if not exists idx_usage_events_model on usage_events(model)`,
 		`create index if not exists idx_usage_events_auth_index on usage_events(auth_index)`,
 		`create index if not exists idx_usage_events_endpoint on usage_events(endpoint)`,
+		`create index if not exists idx_usage_events_api_key_hash on usage_events(api_key_hash)`,
 		`create table if not exists auth_cooldowns (
 			auth_id text not null,
 			auth_index text,
@@ -273,6 +282,46 @@ func (s *Store) init() error {
 		`create index if not exists idx_auth_cooldowns_next_retry on auth_cooldowns(next_retry_after_ms)`,
 	}
 	for _, statement := range statements {
+		if _, err := s.db.Exec(statement); err != nil {
+			return err
+		}
+	}
+	if err := s.ensureUsageEventColumns(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureUsageEventColumns() error {
+	columns := map[string]string{
+		"source_full": `alter table usage_events add column source_full text`,
+		"status_code": `alter table usage_events add column status_code integer not null default 0`,
+	}
+	rows, err := s.db.Query(`pragma table_info(usage_events)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	existing := map[string]struct{}{}
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for name, statement := range columns {
+		if _, ok := existing[name]; ok {
+			continue
+		}
 		if _, err := s.db.Exec(statement); err != nil {
 			return err
 		}
@@ -393,8 +442,9 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 	}
 
 	failed := record.Failed
+	statusCode := internallogging.GetResponseStatus(ctx)
 	if !failed {
-		failed = !responseSucceeded(ctx)
+		failed = !responseSucceeded(statusCode)
 	}
 
 	sourceRaw := strings.TrimSpace(record.Source)
@@ -411,6 +461,7 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 		AuthType:        strings.TrimSpace(record.AuthType),
 		AuthIndex:       strings.TrimSpace(record.AuthIndex),
 		Source:          maskSource(sourceRaw),
+		SourceFull:      displaySourceFull(sourceRaw),
 		SourceHash:      hashString(sourceRaw),
 		APIKeyHash:      hashString(apiKey),
 		InputTokens:     tokens.InputTokens,
@@ -421,6 +472,7 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 		TotalTokens:     tokens.TotalTokens,
 		LatencyMS:       latencyPtr,
 		Failed:          failed,
+		StatusCode:      statusCode,
 		CreatedAtMS:     time.Now().UnixMilli(),
 	}
 	event.RawJSON = rawEventJSON(event, record.Alias)
@@ -453,10 +505,10 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 	}()
 	stmt, err := tx.PrepareContext(ctx, `insert or ignore into usage_events (
 		request_id, event_hash, timestamp_ms, timestamp, provider, model, endpoint, method, path,
-		auth_type, auth_index, source, source_hash, api_key_hash, input_tokens, output_tokens,
-		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, raw_json,
+		auth_type, auth_index, source, source_full, source_hash, api_key_hash, input_tokens, output_tokens,
+		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, status_code, raw_json,
 		created_at_ms
-	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return result, err
 	}
@@ -477,6 +529,7 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 			event.AuthType,
 			event.AuthIndex,
 			event.Source,
+			event.SourceFull,
 			event.SourceHash,
 			event.APIKeyHash,
 			event.InputTokens,
@@ -487,6 +540,7 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 			event.TotalTokens,
 			nullInt64(event.LatencyMS),
 			boolToInt(event.Failed),
+			event.StatusCode,
 			event.RawJSON,
 			event.CreatedAtMS,
 		)
@@ -527,8 +581,8 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 	}
 	rows, err := s.db.QueryContext(ctx, `select
 		request_id, event_hash, timestamp_ms, timestamp, provider, model, endpoint, method, path,
-		auth_type, auth_index, source, source_hash, api_key_hash, input_tokens, output_tokens,
-		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, raw_json,
+		auth_type, auth_index, source, source_full, source_hash, api_key_hash, input_tokens, output_tokens,
+		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, status_code, raw_json,
 		created_at_ms
 		from usage_events order by timestamp_ms desc, id desc limit ?`, limit)
 	if err != nil {
@@ -554,6 +608,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 			&event.AuthType,
 			&event.AuthIndex,
 			&event.Source,
+			&event.SourceFull,
 			&event.SourceHash,
 			&event.APIKeyHash,
 			&event.InputTokens,
@@ -564,6 +619,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 			&event.TotalTokens,
 			&latency,
 			&failed,
+			&event.StatusCode,
 			&event.RawJSON,
 			&event.CreatedAtMS,
 		); err != nil {
@@ -739,11 +795,15 @@ func BuildPayload(events []Event) Payload {
 			apiEntry.Models[model] = modelEntry
 		}
 		modelEntry.Details = append(modelEntry.Details, Detail{
-			Timestamp: event.Timestamp,
-			Source:    event.Source,
-			AuthIndex: event.AuthIndex,
-			LatencyMS: event.LatencyMS,
-			Failed:    event.Failed,
+			Timestamp:  event.Timestamp,
+			Source:     event.Source,
+			SourceFull: event.SourceFull,
+			SourceHash: event.SourceHash,
+			APIKeyHash: event.APIKeyHash,
+			AuthIndex:  event.AuthIndex,
+			LatencyMS:  event.LatencyMS,
+			StatusCode: event.StatusCode,
+			Failed:     event.Failed,
 			Tokens: Tokens{
 				InputTokens:     event.InputTokens,
 				OutputTokens:    event.OutputTokens,
@@ -934,8 +994,19 @@ func normalizeEvent(event Event) Event {
 	if event.CreatedAtMS == 0 {
 		event.CreatedAtMS = time.Now().UnixMilli()
 	}
+	event.SourceFull = displaySourceFull(event.SourceFull)
+	if strings.TrimSpace(event.Source) == "" && event.SourceFull != "" {
+		event.Source = maskSource(event.SourceFull)
+	}
 	if event.SourceHash == "" {
-		event.SourceHash = hashString(event.Source)
+		if event.SourceFull != "" {
+			event.SourceHash = hashString(event.SourceFull)
+		} else {
+			event.SourceHash = hashString(event.Source)
+		}
+	}
+	if event.StatusCode < 0 {
+		event.StatusCode = 0
 	}
 	if event.EventHash == "" {
 		event.EventHash = buildEventHash(event)
@@ -986,8 +1057,7 @@ func normalizeTokens(detail coreusage.Detail) Tokens {
 	return tokens
 }
 
-func responseSucceeded(ctx context.Context) bool {
-	status := internallogging.GetResponseStatus(ctx)
+func responseSucceeded(status int) bool {
 	if status == 0 {
 		return true
 	}
@@ -1021,6 +1091,7 @@ func rawEventJSON(event Event, alias string) string {
 		"auth_type":        event.AuthType,
 		"auth_index":       event.AuthIndex,
 		"source":           event.Source,
+		"source_full":      event.SourceFull,
 		"source_hash":      event.SourceHash,
 		"api_key_hash":     event.APIKeyHash,
 		"input_tokens":     event.InputTokens,
@@ -1031,6 +1102,7 @@ func rawEventJSON(event Event, alias string) string {
 		"total_tokens":     event.TotalTokens,
 		"latency_ms":       event.LatencyMS,
 		"failed":           event.Failed,
+		"status_code":      event.StatusCode,
 	}
 	data, _ := json.Marshal(payload)
 	return string(data)
@@ -1078,7 +1150,18 @@ func maskSource(value string) string {
 	return trimmed
 }
 
+func displaySourceFull(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || looksSecret(trimmed) {
+		return ""
+	}
+	return trimmed
+}
+
 func looksSecret(value string) bool {
+	if strings.Contains(value, "@") {
+		return false
+	}
 	if strings.ContainsAny(value, " /\\") {
 		return false
 	}
