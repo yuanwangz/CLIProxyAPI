@@ -169,6 +169,39 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 	}
 }
 
+func TestRecentEventsHandlesNullOptionalTextFields(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	_, err := store.db.ExecContext(ctx, `insert into usage_events (
+		event_hash, timestamp_ms, timestamp, model, source, input_tokens, output_tokens, total_tokens, created_at_ms
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"null-source-full",
+		time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC).UnixMilli(),
+		"2026-01-02T03:04:05Z",
+		"gpt-5",
+		"local",
+		1,
+		2,
+		3,
+		time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC).UnixMilli(),
+	)
+	if err != nil {
+		t.Fatalf("insert raw event: %v", err)
+	}
+
+	events, err := store.RecentEvents(ctx, 10)
+	if err != nil {
+		t.Fatalf("recent events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	if events[0].SourceFull != "" || events[0].RawJSON != "" {
+		t.Fatalf("nullable text fields were not normalized: %+v", events[0])
+	}
+}
+
 func TestParseImportPayloadKeepsValidJSONLRecords(t *testing.T) {
 	events, result, err := parseImportPayload([]byte(`{"timestamp":"2026-01-02T03:04:05Z","endpoint":"POST /v1/responses","model":"gpt-5","total_tokens":7}` + "\n" + `not-json`))
 	if err != nil {

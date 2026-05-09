@@ -580,9 +580,11 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 		limit = defaultQueryLimit
 	}
 	rows, err := s.db.QueryContext(ctx, `select
-		request_id, event_hash, timestamp_ms, timestamp, provider, model, endpoint, method, path,
-		auth_type, auth_index, source, source_full, source_hash, api_key_hash, input_tokens, output_tokens,
-		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, status_code, raw_json,
+		coalesce(request_id, ''), event_hash, timestamp_ms, timestamp, coalesce(provider, ''), model,
+		coalesce(endpoint, ''), coalesce(method, ''), coalesce(path, ''),
+		coalesce(auth_type, ''), coalesce(auth_index, ''), coalesce(source, ''), coalesce(source_full, ''),
+		coalesce(source_hash, ''), coalesce(api_key_hash, ''), input_tokens, output_tokens,
+		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, status_code, coalesce(raw_json, ''),
 		created_at_ms
 		from usage_events order by timestamp_ms desc, id desc limit ?`, limit)
 	if err != nil {
