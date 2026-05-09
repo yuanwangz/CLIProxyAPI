@@ -68,6 +68,7 @@ type Event struct {
 	Source          string `json:"source,omitempty"`
 	SourceFull      string `json:"source_full,omitempty"`
 	SourceHash      string `json:"source_hash,omitempty"`
+	APIKey          string `json:"api_key,omitempty"`
 	APIKeyHash      string `json:"api_key_hash,omitempty"`
 	InputTokens     int64  `json:"input_tokens"`
 	OutputTokens    int64  `json:"output_tokens"`
@@ -98,6 +99,7 @@ type Detail struct {
 	Source     string `json:"source"`
 	SourceFull string `json:"source_full,omitempty"`
 	SourceHash string `json:"source_hash,omitempty"`
+	APIKey     string `json:"api_key,omitempty"`
 	APIKeyHash string `json:"api_key_hash,omitempty"`
 	AuthIndex  string `json:"auth_index,omitempty"`
 	LatencyMS  *int64 `json:"latency_ms,omitempty"`
@@ -245,6 +247,7 @@ func (s *Store) init() error {
 			source text,
 			source_full text,
 			source_hash text,
+			api_key text,
 			api_key_hash text,
 			input_tokens integer not null default 0,
 			output_tokens integer not null default 0,
@@ -295,6 +298,7 @@ func (s *Store) init() error {
 func (s *Store) ensureUsageEventColumns() error {
 	columns := map[string]string{
 		"source_full": `alter table usage_events add column source_full text`,
+		"api_key":     `alter table usage_events add column api_key text`,
 		"status_code": `alter table usage_events add column status_code integer not null default 0`,
 	}
 	rows, err := s.db.Query(`pragma table_info(usage_events)`)
@@ -463,6 +467,7 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 		Source:          maskSource(sourceRaw),
 		SourceFull:      displaySourceFull(sourceRaw),
 		SourceHash:      hashString(sourceRaw),
+		APIKey:          maskAPIKey(apiKey),
 		APIKeyHash:      hashString(apiKey),
 		InputTokens:     tokens.InputTokens,
 		OutputTokens:    tokens.OutputTokens,
@@ -505,10 +510,10 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 	}()
 	stmt, err := tx.PrepareContext(ctx, `insert or ignore into usage_events (
 		request_id, event_hash, timestamp_ms, timestamp, provider, model, endpoint, method, path,
-		auth_type, auth_index, source, source_full, source_hash, api_key_hash, input_tokens, output_tokens,
+		auth_type, auth_index, source, source_full, source_hash, api_key, api_key_hash, input_tokens, output_tokens,
 		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, status_code, raw_json,
 		created_at_ms
-	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return result, err
 	}
@@ -531,6 +536,7 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 			event.Source,
 			event.SourceFull,
 			event.SourceHash,
+			event.APIKey,
 			event.APIKeyHash,
 			event.InputTokens,
 			event.OutputTokens,
@@ -583,7 +589,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 		coalesce(request_id, ''), event_hash, timestamp_ms, timestamp, coalesce(provider, ''), model,
 		coalesce(endpoint, ''), coalesce(method, ''), coalesce(path, ''),
 		coalesce(auth_type, ''), coalesce(auth_index, ''), coalesce(source, ''), coalesce(source_full, ''),
-		coalesce(source_hash, ''), coalesce(api_key_hash, ''), input_tokens, output_tokens,
+		coalesce(source_hash, ''), coalesce(api_key, ''), coalesce(api_key_hash, ''), input_tokens, output_tokens,
 		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, status_code, coalesce(raw_json, ''),
 		created_at_ms
 		from usage_events order by timestamp_ms desc, id desc limit ?`, limit)
@@ -612,6 +618,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 			&event.Source,
 			&event.SourceFull,
 			&event.SourceHash,
+			&event.APIKey,
 			&event.APIKeyHash,
 			&event.InputTokens,
 			&event.OutputTokens,
@@ -801,6 +808,7 @@ func BuildPayload(events []Event) Payload {
 			Source:     event.Source,
 			SourceFull: event.SourceFull,
 			SourceHash: event.SourceHash,
+			APIKey:     event.APIKey,
 			APIKeyHash: event.APIKeyHash,
 			AuthIndex:  event.AuthIndex,
 			LatencyMS:  event.LatencyMS,
@@ -997,6 +1005,7 @@ func normalizeEvent(event Event) Event {
 		event.CreatedAtMS = time.Now().UnixMilli()
 	}
 	event.SourceFull = displaySourceFull(event.SourceFull)
+	event.APIKey = maskAPIKey(event.APIKey)
 	if strings.TrimSpace(event.Source) == "" && event.SourceFull != "" {
 		event.Source = maskSource(event.SourceFull)
 	}
@@ -1095,6 +1104,7 @@ func rawEventJSON(event Event, alias string) string {
 		"source":           event.Source,
 		"source_full":      event.SourceFull,
 		"source_hash":      event.SourceHash,
+		"api_key":          event.APIKey,
 		"api_key_hash":     event.APIKeyHash,
 		"input_tokens":     event.InputTokens,
 		"output_tokens":    event.OutputTokens,
@@ -1158,6 +1168,20 @@ func displaySourceFull(value string) string {
 		return ""
 	}
 	return trimmed
+}
+
+func maskAPIKey(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, "...") || strings.Contains(trimmed, "***") {
+		return trimmed
+	}
+	if len(trimmed) <= 8 {
+		return "****"
+	}
+	return trimmed[:4] + "..." + trimmed[len(trimmed)-4:]
 }
 
 func looksSecret(value string) bool {

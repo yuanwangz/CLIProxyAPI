@@ -52,6 +52,9 @@ func TestBuildEventNormalizesUsageRecord(t *testing.T) {
 	if event.SourceFull != "person@example.com" {
 		t.Fatalf("source full = %q, want full email", event.SourceFull)
 	}
+	if event.APIKey != "sk-t...wxyz" {
+		t.Fatalf("api key = %q, want masked client key", event.APIKey)
+	}
 	if event.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status code = %d, want %d", event.StatusCode, http.StatusInternalServerError)
 	}
@@ -85,6 +88,7 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 			Model:        "gpt-5",
 			Source:       "local",
 			SourceFull:   "local-full",
+			APIKey:       "client-key-123456",
 			APIKeyHash:   "client-key-hash",
 			AuthIndex:    "account-1",
 			InputTokens:  1,
@@ -99,6 +103,7 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 			Model:        "gpt-5",
 			Source:       "local",
 			SourceFull:   "local-full",
+			APIKey:       "client-key-123456",
 			APIKeyHash:   "client-key-hash",
 			OutputTokens: 4,
 			TotalTokens:  4,
@@ -121,6 +126,7 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 			Model:        "gpt-5",
 			Source:       "local",
 			SourceFull:   "local-full",
+			APIKey:       "client-key-123456",
 			APIKeyHash:   "client-key-hash",
 			AuthIndex:    "account-1",
 			InputTokens:  1,
@@ -149,7 +155,7 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 		t.Fatalf("payload api entry = %+v", apiEntry)
 	}
 	detail := apiEntry.Models["gpt-5"].Details[0]
-	if detail.SourceFull != "local-full" || detail.APIKeyHash != "client-key-hash" || detail.StatusCode != http.StatusTooManyRequests {
+	if detail.SourceFull != "local-full" || detail.APIKey != "clie...3456" || detail.APIKeyHash != "client-key-hash" || detail.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("payload detail did not preserve extended fields: %+v", detail)
 	}
 
