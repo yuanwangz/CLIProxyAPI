@@ -205,6 +205,76 @@ func TestManagerRestorePersistedCooldownMigratesLegacyAuthIndex(t *testing.T) {
 	waitForPersistedCooldownAuthIndex(t, auth.ID, "gpt-image-2", currentIndex)
 }
 
+func TestManagerRestorePersistedCooldownMigratesLegacyFileAuthIDIndex(t *testing.T) {
+	ctx := context.Background()
+	if err := usagepersist.Init(filepath.Join(t.TempDir(), "usage.sqlite"), true); err != nil {
+		t.Fatalf("init usage persistence: %v", err)
+	}
+
+	manager := NewManager(nil, nil, nil)
+	authFileName := "codex-user@example.com-free.json"
+	authPath := filepath.Join(t.TempDir(), authFileName)
+	auth := &Auth{
+		ID:       authFileName,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":   authPath,
+			"source": authPath,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4-mini"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	currentSnapshot, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("missing auth")
+	}
+	currentIndex := currentSnapshot.EnsureIndex()
+	legacyIndex := stableAuthIndex("file:" + auth.ID)
+	if legacyIndex == "" || legacyIndex == currentIndex {
+		t.Fatalf("legacy index = %q, current index = %q; want distinct non-empty indexes", legacyIndex, currentIndex)
+	}
+
+	nextRetry := time.Now().Add(time.Hour)
+	if err := usagepersist.DefaultStore().UpsertCooldown(ctx, usagepersist.CooldownState{
+		AuthID:         auth.ID,
+		AuthIndex:      legacyIndex,
+		Provider:       "codex",
+		Model:          "gpt-5.4-mini",
+		Reason:         "quota",
+		StatusMessage:  "usage limit reached",
+		HTTPStatus:     429,
+		NextRetryAfter: nextRetry,
+		QuotaExceeded:  true,
+		BackoffLevel:   1,
+	}); err != nil {
+		t.Fatalf("upsert legacy cooldown: %v", err)
+	}
+
+	manager.RestorePersistedCooldowns(ctx, auth.ID)
+
+	restored, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("missing restored auth")
+	}
+	state := restored.ModelStates["gpt-5.4-mini"]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("model state = %#v, want restored cooldown", state)
+	}
+
+	waitForPersistedCooldownAuthIndex(t, auth.ID, "gpt-5.4-mini", currentIndex)
+}
+
 func TestPersistedCooldownMatchesLegacyConfigAuthIndex(t *testing.T) {
 	auth := &Auth{
 		ID:       "gemini-key-auth",

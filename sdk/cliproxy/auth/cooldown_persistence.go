@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -242,10 +243,24 @@ func legacyAuthIndexSeeds(auth *Auth) []string {
 		return nil
 	}
 
-	seeds := make([]string, 0, 3)
-	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
-		seeds = append(seeds, "file:"+fileName)
+	seeds := make([]string, 0, 8)
+	appendSeed := func(seed string) {
+		if seed = strings.TrimSpace(seed); seed != "" {
+			seeds = append(seeds, seed)
+		}
 	}
+	appendLegacyFileSeed := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		appendSeed("file:" + value)
+		if base := filepath.Base(value); base != "" && base != "." && base != string(filepath.Separator) && base != value {
+			appendSeed("file:" + base)
+		}
+	}
+	appendLegacyFileSeed(auth.FileName)
+	appendLegacyFileSeed(auth.ID)
 
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
 	compatName := ""
@@ -260,6 +275,8 @@ func legacyAuthIndexSeeds(auth *Auth) []string {
 		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
 		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
 		source = strings.TrimSpace(auth.Attributes["source"])
+		appendLegacyFileSeed(auth.Attributes["path"])
+		appendLegacyFileSeed(source)
 	}
 
 	proxyURL := strings.TrimSpace(auth.ProxyURL)
@@ -281,11 +298,11 @@ func legacyAuthIndexSeeds(auth *Auth) []string {
 		if source != "" {
 			parts = append(parts, "source="+source)
 		}
-		seeds = append(seeds, "config:"+strings.Join(parts, "\x00"))
+		appendSeed("config:" + strings.Join(parts, "\x00"))
 	}
 
 	if id := strings.TrimSpace(auth.ID); id != "" {
-		seeds = append(seeds, "id:"+id)
+		appendSeed("id:" + id)
 	}
 	return seeds
 }
