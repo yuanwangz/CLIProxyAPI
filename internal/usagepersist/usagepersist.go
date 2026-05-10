@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -446,7 +447,7 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 	}
 
 	failed := record.Failed
-	statusCode := internallogging.GetResponseStatus(ctx)
+	statusCode := usageStatusCode(ctx, record)
 	if !failed {
 		failed = !responseSucceeded(statusCode)
 	}
@@ -1073,6 +1074,24 @@ func responseSucceeded(status int) bool {
 		return true
 	}
 	return status < 400
+}
+
+func usageStatusCode(ctx context.Context, record coreusage.Record) int {
+	responseStatus := internallogging.GetResponseStatus(ctx)
+	failureStatus := record.Fail.StatusCode
+	if record.Failed && failureStatus > 0 {
+		return failureStatus
+	}
+	if responseStatus > 0 {
+		return responseStatus
+	}
+	if failureStatus > 0 {
+		return failureStatus
+	}
+	if !record.Failed {
+		return http.StatusOK
+	}
+	return 0
 }
 
 func splitEndpoint(endpoint string) (string, string) {

@@ -75,6 +75,63 @@ func TestBuildEventNormalizesUsageRecord(t *testing.T) {
 	}
 }
 
+func TestBuildEventUsesFailureStatusCodeForProviderAttempt(t *testing.T) {
+	ctx := internallogging.WithEndpoint(context.Background(), "POST /v1/responses")
+
+	event := BuildEvent(ctx, coreusage.Record{
+		Provider: "codex",
+		Model:    "gpt-5.5",
+		Failed:   true,
+		Fail: coreusage.Failure{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       "usage limit reached",
+		},
+	})
+
+	if !event.Failed {
+		t.Fatal("failed = false, want true")
+	}
+	if event.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", event.StatusCode, http.StatusTooManyRequests)
+	}
+}
+
+func TestBuildEventPrefersFailureStatusCodeOverResponseOK(t *testing.T) {
+	ctx := internallogging.WithEndpoint(context.Background(), "POST /v1/responses")
+	ctx = internallogging.WithResponseStatusHolder(ctx)
+	internallogging.SetResponseStatus(ctx, http.StatusOK)
+
+	event := BuildEvent(ctx, coreusage.Record{
+		Provider: "codex",
+		Model:    "gpt-5.5",
+		Failed:   true,
+		Fail: coreusage.Failure{
+			StatusCode: http.StatusUnauthorized,
+			Body:       "invalid credential",
+		},
+	})
+
+	if event.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", event.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestBuildEventDefaultsSuccessfulMissingStatusToOK(t *testing.T) {
+	ctx := internallogging.WithEndpoint(context.Background(), "POST /v1/responses")
+
+	event := BuildEvent(ctx, coreusage.Record{
+		Provider: "codex",
+		Model:    "gpt-5.5",
+	})
+
+	if event.Failed {
+		t.Fatal("failed = true, want false")
+	}
+	if event.StatusCode != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", event.StatusCode, http.StatusOK)
+	}
+}
+
 func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
