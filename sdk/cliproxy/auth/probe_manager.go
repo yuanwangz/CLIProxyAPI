@@ -1,6 +1,6 @@
 package auth
 
-import internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+import internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 
 // CloneForProbe returns a detached manager snapshot suitable for internal
 // fallback probes. It shares executors and selector behavior with the source

@@ -3,8 +3,8 @@ package imagesfallback
 import (
 	"context"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/chatgptimage"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/chatgptimage"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func (s *Service) executeWithChatGPTImage(ctx context.Context, auth *coreauth.Auth, req Request) (*Result, error) {

@@ -11,12 +11,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/imagesfallback"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	executorhelps "github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/imagesfallback"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -523,5 +522,5 @@ func (h *OpenAIAPIHandler) publishImageFallbackFinalUsage(ctx context.Context, a
 		return
 	}
 	reporter.EnsurePublished(usageCtx)
-	reporter.PublishAdditionalModel(usageCtx, firstNonEmptyString(strings.TrimSpace(requestedModel), defaultImagesToolModel), coreusage.Detail{})
+	reporter.PublishAdditionalModelEvent(usageCtx, firstNonEmptyString(strings.TrimSpace(requestedModel), defaultImagesToolModel))
 }

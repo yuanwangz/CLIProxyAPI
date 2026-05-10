@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // SelectedAuthExecutor runs custom provider-specific work with an auth selected by Manager.

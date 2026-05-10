@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestResolveWebModel(t *testing.T) {
