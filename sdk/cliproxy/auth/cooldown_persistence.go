@@ -29,13 +29,15 @@ func (m *Manager) RestorePersistedCooldowns(ctx context.Context, authID string) 
 
 	supported := supportedModelKeysForAuth(authID)
 	var snapshot *Auth
+	migrations := make([]usagepersist.CooldownState, 0)
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
 	if ok && auth != nil {
 		authIndex := auth.EnsureIndex()
 		changed := false
 		for _, cooldown := range cooldowns {
-			if !persistedCooldownMatchesAuth(auth, authIndex, cooldown) {
+			matched, migrateIndex := persistedCooldownMatchesAuth(auth, authIndex, cooldown)
+			if !matched {
 				continue
 			}
 			model := strings.TrimSpace(cooldown.Model)
@@ -44,6 +46,16 @@ func (m *Manager) RestorePersistedCooldowns(ctx context.Context, authID string) 
 			}
 			if applyPersistedCooldown(auth, cooldown, now) {
 				changed = true
+				if migrateIndex && strings.TrimSpace(authIndex) != "" {
+					cooldown.AuthIndex = authIndex
+					if strings.TrimSpace(cooldown.Provider) == "" {
+						cooldown.Provider = auth.Provider
+					}
+					if cooldown.UpdatedAt.IsZero() {
+						cooldown.UpdatedAt = now
+					}
+					migrations = append(migrations, cooldown)
+				}
 			}
 		}
 		if changed {
@@ -54,6 +66,10 @@ func (m *Manager) RestorePersistedCooldowns(ctx context.Context, authID string) 
 		}
 	}
 	m.mu.Unlock()
+
+	for _, cooldown := range migrations {
+		usagepersist.PersistCooldownAsync(cooldown)
+	}
 
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
@@ -173,18 +189,105 @@ func supportedModelKeysForAuth(authID string) map[string]struct{} {
 	return out
 }
 
-func persistedCooldownMatchesAuth(auth *Auth, authIndex string, cooldown usagepersist.CooldownState) bool {
+func persistedCooldownMatchesAuth(auth *Auth, authIndex string, cooldown usagepersist.CooldownState) (bool, bool) {
 	if auth == nil {
-		return false
+		return false, false
 	}
 	if strings.TrimSpace(cooldown.AuthID) != strings.TrimSpace(auth.ID) {
-		return false
+		return false, false
 	}
 	if cooldown.Provider != "" && !strings.EqualFold(strings.TrimSpace(cooldown.Provider), strings.TrimSpace(auth.Provider)) {
-		return false
+		return false, false
 	}
 	cooldownIndex := strings.TrimSpace(cooldown.AuthIndex)
-	return cooldownIndex == "" || authIndex == "" || cooldownIndex == authIndex
+	authIndex = strings.TrimSpace(authIndex)
+	if cooldownIndex == "" || authIndex == "" || cooldownIndex == authIndex {
+		return true, false
+	}
+	for _, legacyIndex := range legacyAuthIndexes(auth) {
+		if cooldownIndex == legacyIndex {
+			return true, true
+		}
+	}
+	return false, false
+}
+
+func legacyAuthIndexes(auth *Auth) []string {
+	seeds := legacyAuthIndexSeeds(auth)
+	if len(seeds) == 0 {
+		return nil
+	}
+	indexes := make([]string, 0, len(seeds))
+	seen := make(map[string]struct{}, len(seeds))
+	for _, seed := range seeds {
+		seed = strings.TrimSpace(seed)
+		if seed == "" {
+			continue
+		}
+		index := stableAuthIndex(seed)
+		if index == "" {
+			continue
+		}
+		if _, ok := seen[index]; ok {
+			continue
+		}
+		seen[index] = struct{}{}
+		indexes = append(indexes, index)
+	}
+	return indexes
+}
+
+func legacyAuthIndexSeeds(auth *Auth) []string {
+	if auth == nil {
+		return nil
+	}
+
+	seeds := make([]string, 0, 3)
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		seeds = append(seeds, "file:"+fileName)
+	}
+
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	compatName := ""
+	baseURL := ""
+	apiKey := ""
+	source := ""
+	if auth.Attributes != nil {
+		if value := strings.TrimSpace(auth.Attributes["provider_key"]); value != "" {
+			providerKey = strings.ToLower(value)
+		}
+		compatName = strings.ToLower(strings.TrimSpace(auth.Attributes["compat_name"]))
+		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+		source = strings.TrimSpace(auth.Attributes["source"])
+	}
+
+	proxyURL := strings.TrimSpace(auth.ProxyURL)
+	hasCredentialIdentity := compatName != "" || baseURL != "" || proxyURL != "" || apiKey != "" || source != ""
+	if providerKey != "" && hasCredentialIdentity {
+		parts := []string{"provider=" + providerKey}
+		if compatName != "" {
+			parts = append(parts, "compat="+compatName)
+		}
+		if baseURL != "" {
+			parts = append(parts, "base="+baseURL)
+		}
+		if proxyURL != "" {
+			parts = append(parts, "proxy="+proxyURL)
+		}
+		if apiKey != "" {
+			parts = append(parts, "api_key="+apiKey)
+		}
+		if source != "" {
+			parts = append(parts, "source="+source)
+		}
+		seeds = append(seeds, "config:"+strings.Join(parts, "\x00"))
+	}
+
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		seeds = append(seeds, "id:"+id)
+	}
+	return seeds
 }
 
 func restoredCooldownModelSupported(supported map[string]struct{}, model string) bool {

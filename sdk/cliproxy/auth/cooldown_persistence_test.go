@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,6 +133,107 @@ func TestManagerRestorePersistedCooldownKeepsImageAndTextModelsSeparate(t *testi
 	}
 }
 
+func TestManagerRestorePersistedCooldownMigratesLegacyAuthIndex(t *testing.T) {
+	ctx := context.Background()
+	if err := usagepersist.Init(filepath.Join(t.TempDir(), "usage.sqlite"), true); err != nil {
+		t.Fatalf("init usage persistence: %v", err)
+	}
+
+	manager := NewManager(nil, nil, nil)
+	authPath := filepath.Join(t.TempDir(), "codex-user.json")
+	auth := &Auth{
+		ID:       "legacy-codex-user.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":   authPath,
+			"source": authPath,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-image-2"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	currentSnapshot, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("missing auth")
+	}
+	currentIndex := currentSnapshot.EnsureIndex()
+	legacyIndex := stableAuthIndex("config:" + strings.Join([]string{
+		"provider=codex",
+		"source=" + authPath,
+	}, "\x00"))
+	if legacyIndex == "" || legacyIndex == currentIndex {
+		t.Fatalf("legacy index = %q, current index = %q; want distinct non-empty indexes", legacyIndex, currentIndex)
+	}
+
+	nextRetry := time.Now().Add(time.Hour)
+	if err := usagepersist.DefaultStore().UpsertCooldown(ctx, usagepersist.CooldownState{
+		AuthID:         auth.ID,
+		AuthIndex:      legacyIndex,
+		Provider:       "codex",
+		Model:          "gpt-image-2",
+		Reason:         "quota",
+		StatusMessage:  "image generation limit",
+		HTTPStatus:     429,
+		NextRetryAfter: nextRetry,
+		QuotaExceeded:  true,
+		BackoffLevel:   1,
+	}); err != nil {
+		t.Fatalf("upsert legacy cooldown: %v", err)
+	}
+
+	manager.RestorePersistedCooldowns(ctx, auth.ID)
+
+	restored, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("missing restored auth")
+	}
+	state := restored.ModelStates["gpt-image-2"]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("model state = %#v, want restored cooldown", state)
+	}
+
+	waitForPersistedCooldownAuthIndex(t, auth.ID, "gpt-image-2", currentIndex)
+}
+
+func TestPersistedCooldownMatchesLegacyConfigAuthIndex(t *testing.T) {
+	auth := &Auth{
+		ID:       "gemini-key-auth",
+		Provider: "gemini",
+		Attributes: map[string]string{
+			"api_key": "shared-key",
+			"source":  "config:gemini[token]",
+		},
+	}
+	currentIndex := auth.EnsureIndex()
+	legacyIndex := stableAuthIndex("config:" + strings.Join([]string{
+		"provider=gemini",
+		"api_key=shared-key",
+		"source=config:gemini[token]",
+	}, "\x00"))
+	if legacyIndex == "" || legacyIndex == currentIndex {
+		t.Fatalf("legacy index = %q, current index = %q; want distinct non-empty indexes", legacyIndex, currentIndex)
+	}
+
+	matched, migrate := persistedCooldownMatchesAuth(auth, currentIndex, usagepersist.CooldownState{
+		AuthID:    auth.ID,
+		AuthIndex: legacyIndex,
+		Provider:  "gemini",
+	})
+	if !matched || !migrate {
+		t.Fatalf("legacy config auth index matched=%v migrate=%v, want true/true", matched, migrate)
+	}
+}
+
 func waitForPersistedCooldownCount(t *testing.T, authID string, want int) []usagepersist.CooldownState {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -153,4 +255,30 @@ func waitForPersistedCooldownCount(t *testing.T, authID string, want int) []usag
 	}
 	t.Fatalf("cooldown count = %d, want %d; last=%+v", len(last), want, last)
 	return nil
+}
+
+func waitForPersistedCooldownAuthIndex(t *testing.T, authID string, model string, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last []usagepersist.CooldownState
+	var lastErr error
+	for time.Now().Before(deadline) {
+		store := usagepersist.DefaultStore()
+		if store == nil {
+			t.Fatalf("usage persistence store is not initialized")
+		}
+		last, lastErr = store.ActiveCooldownsByAuth(context.Background(), authID, time.Now())
+		if lastErr == nil {
+			for _, cooldown := range last {
+				if cooldown.Model == model && cooldown.AuthIndex == want {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Fatalf("cooldown auth index not migrated to %q, last error: %v", want, lastErr)
+	}
+	t.Fatalf("cooldown auth index not migrated to %q; last=%+v", want, last)
 }
