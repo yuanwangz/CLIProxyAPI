@@ -26,9 +26,10 @@ import (
 )
 
 const (
-	defaultQueryLimit = 50000
-	queueSize         = 2048
-	cooldownQueueSize = 1024
+	defaultQueryLimit      = 50000
+	queueSize              = 2048
+	cooldownQueueSize      = 1024
+	quotaSnapshotQueueSize = 1024
 )
 
 type Store struct {
@@ -166,6 +167,8 @@ var (
 	pluginOnce   sync.Once
 	cooldownOnce sync.Once
 	cooldownCh   chan cooldownCommand
+	quotaOnce    sync.Once
+	quotaCh      chan QuotaSnapshot
 
 	errUnsupportedImportEvent = errors.New("unsupported usage import event")
 )
@@ -216,6 +219,10 @@ func Init(path string, initiallyEnabled bool) error {
 	cooldownOnce.Do(func() {
 		cooldownCh = make(chan cooldownCommand, cooldownQueueSize)
 		go runCooldownCommands()
+	})
+	quotaOnce.Do(func() {
+		quotaCh = make(chan QuotaSnapshot, quotaSnapshotQueueSize)
+		go runQuotaSnapshots()
 	})
 	return nil
 }
@@ -422,6 +429,18 @@ func runCooldownCommands() {
 	}
 }
 
+func runQuotaSnapshots() {
+	for snapshot := range quotaCh {
+		store := DefaultStore()
+		if store == nil {
+			continue
+		}
+		if _, err := store.UpsertQuotaSnapshot(context.Background(), snapshot); err != nil {
+			log.WithError(err).Warn("failed to persist quota snapshot")
+		}
+	}
+}
+
 func PersistCooldownAsync(state CooldownState) {
 	enqueueCooldownCommand(cooldownCommand{action: "upsert", state: state})
 }
@@ -449,6 +468,17 @@ func enqueueCooldownCommand(command cooldownCommand) {
 	case cooldownCh <- command:
 	default:
 		log.Warn("auth cooldown persistence queue is full; dropping cooldown update")
+	}
+}
+
+func UpsertQuotaSnapshotAsync(snapshot QuotaSnapshot) {
+	if quotaCh == nil {
+		return
+	}
+	select {
+	case quotaCh <- snapshot:
+	default:
+		log.Warn("quota snapshot persistence queue is full; dropping quota snapshot")
 	}
 }
 

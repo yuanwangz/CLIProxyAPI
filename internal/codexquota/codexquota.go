@@ -281,7 +281,7 @@ func quotaWindowForSnapshot(snapshot rateLimitSnapshot, kind string, window *rat
 	}
 }
 
-func persist(ctx context.Context, auth *cliproxyauth.Auth, state quotaState) {
+func persist(_ context.Context, auth *cliproxyauth.Auth, state quotaState) {
 	if usagepersist.DefaultStore() == nil || auth == nil {
 		return
 	}
@@ -298,16 +298,13 @@ func persist(ctx context.Context, auth *cliproxyauth.Auth, state quotaState) {
 	if fileName == "" {
 		fileName = strings.TrimSpace(auth.ID)
 	}
-	_, err = usagepersist.UpsertQuotaSnapshot(ctx, usagepersist.QuotaSnapshot{
+	usagepersist.UpsertQuotaSnapshotAsync(usagepersist.QuotaSnapshot{
 		Provider:  providerCodex,
 		AuthID:    strings.TrimSpace(auth.ID),
 		AuthIndex: authIndex,
 		FileName:  fileName,
 		QuotaJSON: string(quotaJSON),
 	})
-	if err != nil {
-		log.WithError(err).Debug("failed to persist codex quota snapshot")
-	}
 }
 
 func hasRateLimitData(snapshot rateLimitSnapshot) bool {

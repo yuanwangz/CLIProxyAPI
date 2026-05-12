@@ -330,6 +330,36 @@ func TestStoreQuotaSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
+func TestQuotaSnapshotAsyncPersistsWhenUsageStatisticsDisabled(t *testing.T) {
+	ctx := context.Background()
+	if err := Init(filepath.Join(t.TempDir(), "usage.sqlite"), false); err != nil {
+		t.Fatalf("init usage persistence: %v", err)
+	}
+
+	UpsertQuotaSnapshotAsync(QuotaSnapshot{
+		Provider:  "codex",
+		AuthID:    "auth-async-quota",
+		AuthIndex: "idx-async-quota",
+		FileName:  "codex-async.json",
+		QuotaJSON: `{"status":"success","windows":[]}`,
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshots, err := QuotaSnapshots(ctx)
+		if err != nil {
+			t.Fatalf("quota snapshots: %v", err)
+		}
+		for _, snapshot := range snapshots {
+			if snapshot.AuthIndex == "idx-async-quota" {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("quota snapshot was not persisted while usage statistics were disabled")
+}
+
 func TestStoreCredentialTokenUsagesAggregatesByAuthIndex(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
