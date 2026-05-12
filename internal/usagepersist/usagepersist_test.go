@@ -291,6 +291,104 @@ func TestParseImportPayloadRejectsUnsupportedObject(t *testing.T) {
 	}
 }
 
+func TestStoreQuotaSnapshotRoundTrip(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	refreshedAt := time.Date(2026, 5, 12, 8, 30, 0, 0, time.UTC)
+	snapshot, err := store.UpsertQuotaSnapshot(ctx, QuotaSnapshot{
+		Provider:    " Codex ",
+		AuthID:      "auth-1",
+		AuthIndex:   "idx-1",
+		FileName:    "codex.json",
+		QuotaJSON:   `{"status":"success","windows":[]}`,
+		RefreshedAt: refreshedAt,
+	})
+	if err != nil {
+		t.Fatalf("upsert quota snapshot: %v", err)
+	}
+	if snapshot.Provider != "codex" || snapshot.AuthIndex != "idx-1" || snapshot.UpdatedAt.IsZero() {
+		t.Fatalf("normalized snapshot = %+v", snapshot)
+	}
+
+	snapshots, err := store.QuotaSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("quota snapshots: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshots len = %d, want 1", len(snapshots))
+	}
+	got := snapshots[0]
+	if got.Provider != "codex" || got.AuthID != "auth-1" || got.AuthIndex != "idx-1" || got.FileName != "codex.json" {
+		t.Fatalf("snapshot identity = %+v", got)
+	}
+	if got.QuotaJSON != `{"status":"success","windows":[]}` {
+		t.Fatalf("quota json = %s", got.QuotaJSON)
+	}
+	if !got.RefreshedAt.Equal(refreshedAt) {
+		t.Fatalf("refreshed at = %s, want %s", got.RefreshedAt, refreshedAt)
+	}
+}
+
+func TestStoreCredentialTokenUsagesAggregatesByAuthIndex(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	_, err := store.InsertEvents(ctx, []Event{
+		{
+			RequestID:       "req-usage-1",
+			Timestamp:       "2026-05-12T08:30:00Z",
+			TimestampMS:     time.Date(2026, 5, 12, 8, 30, 0, 0, time.UTC).UnixMilli(),
+			Model:           "gpt-5",
+			AuthIndex:       "idx-usage",
+			InputTokens:     10,
+			OutputTokens:    20,
+			ReasoningTokens: 3,
+			CachedTokens:    4,
+			CacheTokens:     4,
+			TotalTokens:     33,
+		},
+		{
+			RequestID:    "req-usage-2",
+			Timestamp:    "2026-05-12T08:31:00Z",
+			TimestampMS:  time.Date(2026, 5, 12, 8, 31, 0, 0, time.UTC).UnixMilli(),
+			Model:        "gpt-5",
+			AuthIndex:    "idx-usage",
+			OutputTokens: 5,
+			TotalTokens:  5,
+			Failed:       true,
+		},
+		{
+			RequestID:   "req-usage-ignored",
+			Timestamp:   "2026-05-12T08:32:00Z",
+			TimestampMS: time.Date(2026, 5, 12, 8, 32, 0, 0, time.UTC).UnixMilli(),
+			Model:       "gpt-5",
+			TotalTokens: 100,
+		},
+	})
+	if err != nil {
+		t.Fatalf("insert events: %v", err)
+	}
+
+	usages, err := store.CredentialTokenUsages(ctx)
+	if err != nil {
+		t.Fatalf("credential token usages: %v", err)
+	}
+	if len(usages) != 1 {
+		t.Fatalf("usage len = %d, want 1", len(usages))
+	}
+	got := usages[0]
+	if got.AuthIndex != "idx-usage" || got.RequestCount != 2 || got.SuccessCount != 1 || got.FailureCount != 1 {
+		t.Fatalf("usage counts = %+v", got)
+	}
+	if got.InputTokens != 10 || got.OutputTokens != 25 || got.ReasoningTokens != 3 || got.CachedTokens != 4 || got.CacheTokens != 4 || got.TotalTokens != 38 {
+		t.Fatalf("usage tokens = %+v", got)
+	}
+	if got.LastUsedAt == "" || got.LastUsedAtMS == 0 {
+		t.Fatalf("last used fields missing: %+v", got)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 

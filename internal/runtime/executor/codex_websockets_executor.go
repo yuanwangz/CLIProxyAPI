@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexquota"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -268,6 +269,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	persistCodexWebsocketHandshakeQuota(ctx, auth, respHS)
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
 		defer func() {
@@ -311,6 +313,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					AuthValue: authValue,
 				})
 				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+				persistCodexWebsocketHandshakeQuota(ctx, auth, respHSRetry)
 				if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
 					conn = connRetry
 					wsReqBody = wsReqBodyRetry
@@ -367,6 +370,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 		payload = normalizeCodexWebsocketCompletion(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
+		if eventType == "codex.rate_limits" {
+			codexquota.PersistFromEvent(ctx, auth, payload)
+		}
 		if eventType == "response.completed" {
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
@@ -474,6 +480,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	persistCodexWebsocketHandshakeQuota(ctx, auth, respHS)
 
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
@@ -512,6 +519,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				AuthValue: authValue,
 			})
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
+			persistCodexWebsocketHandshakeQuota(ctx, auth, respHSRetry)
 			if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
@@ -620,6 +628,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			payload = normalizeCodexWebsocketCompletion(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
+			if eventType == "codex.rate_limits" {
+				codexquota.PersistFromEvent(ctx, auth, payload)
+			}
 			if eventType == "response.completed" || eventType == "response.done" {
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					reporter.Publish(ctx, detail)
@@ -1179,6 +1190,13 @@ func recordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, resp *
 	}
 	helps.RecordAPIWebsocketHandshake(ctx, cfg, resp.StatusCode, resp.Header.Clone())
 	closeHTTPResponseBody(resp, "codex websockets executor: close handshake response body error")
+}
+
+func persistCodexWebsocketHandshakeQuota(ctx context.Context, auth *cliproxyauth.Auth, resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	codexquota.PersistFromHeaders(ctx, auth, resp.Header)
 }
 
 func websocketHandshakeBody(resp *http.Response) []byte {

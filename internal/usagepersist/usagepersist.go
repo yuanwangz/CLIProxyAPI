@@ -109,6 +109,31 @@ type Detail struct {
 	Failed     bool   `json:"failed"`
 }
 
+type QuotaSnapshot struct {
+	Provider    string
+	AuthID      string
+	AuthIndex   string
+	FileName    string
+	QuotaJSON   string
+	RefreshedAt time.Time
+	UpdatedAt   time.Time
+}
+
+type CredentialTokenUsage struct {
+	AuthIndex       string `json:"auth_index"`
+	RequestCount    int64  `json:"request_count"`
+	SuccessCount    int64  `json:"success_count"`
+	FailureCount    int64  `json:"failure_count"`
+	InputTokens     int64  `json:"input_tokens"`
+	OutputTokens    int64  `json:"output_tokens"`
+	ReasoningTokens int64  `json:"reasoning_tokens"`
+	CachedTokens    int64  `json:"cached_tokens"`
+	CacheTokens     int64  `json:"cache_tokens"`
+	TotalTokens     int64  `json:"total_tokens"`
+	LastUsedAt      string `json:"last_used_at,omitempty"`
+	LastUsedAtMS    int64  `json:"last_used_at_ms,omitempty"`
+}
+
 type ModelAggregate struct {
 	Details []Detail `json:"details"`
 }
@@ -284,6 +309,18 @@ func (s *Store) init() error {
 		)`,
 		`create index if not exists idx_auth_cooldowns_auth_index on auth_cooldowns(auth_index)`,
 		`create index if not exists idx_auth_cooldowns_next_retry on auth_cooldowns(next_retry_after_ms)`,
+		`create table if not exists quota_snapshots (
+			provider text not null,
+			auth_index text not null,
+			auth_id text,
+			file_name text,
+			quota_json text not null,
+			refreshed_at_ms integer not null,
+			updated_at_ms integer not null,
+			primary key(provider, auth_index)
+		)`,
+		`create index if not exists idx_quota_snapshots_auth_id on quota_snapshots(auth_id)`,
+		`create index if not exists idx_quota_snapshots_updated_at on quota_snapshots(updated_at_ms)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
@@ -773,6 +810,178 @@ func (s *Store) ActiveCooldownsByAuth(ctx context.Context, authID string, now ti
 		out = append(out, normalizeCooldownState(state))
 	}
 	return out, rows.Err()
+}
+
+func UpsertQuotaSnapshot(ctx context.Context, snapshot QuotaSnapshot) (QuotaSnapshot, error) {
+	store := DefaultStore()
+	if store == nil {
+		return QuotaSnapshot{}, errors.New("usage persistence is not initialized")
+	}
+	return store.UpsertQuotaSnapshot(ctx, snapshot)
+}
+
+func QuotaSnapshots(ctx context.Context) ([]QuotaSnapshot, error) {
+	store := DefaultStore()
+	if store == nil {
+		return nil, nil
+	}
+	return store.QuotaSnapshots(ctx)
+}
+
+func CredentialTokenUsages(ctx context.Context) ([]CredentialTokenUsage, error) {
+	store := DefaultStore()
+	if store == nil {
+		return nil, nil
+	}
+	return store.CredentialTokenUsages(ctx)
+}
+
+func (s *Store) UpsertQuotaSnapshot(ctx context.Context, snapshot QuotaSnapshot) (QuotaSnapshot, error) {
+	if s == nil || s.db == nil {
+		return QuotaSnapshot{}, errors.New("usage store is closed")
+	}
+	snapshot = normalizeQuotaSnapshot(snapshot)
+	if snapshot.Provider == "" {
+		return QuotaSnapshot{}, errors.New("quota snapshot provider is empty")
+	}
+	if snapshot.AuthIndex == "" {
+		return QuotaSnapshot{}, errors.New("quota snapshot auth_index is empty")
+	}
+	if snapshot.QuotaJSON == "" || !json.Valid([]byte(snapshot.QuotaJSON)) {
+		return QuotaSnapshot{}, errors.New("quota snapshot quota_json is invalid")
+	}
+	_, err := s.db.ExecContext(ctx, `insert into quota_snapshots (
+		provider, auth_index, auth_id, file_name, quota_json, refreshed_at_ms, updated_at_ms
+	) values (?, ?, ?, ?, ?, ?, ?)
+	on conflict(provider, auth_index) do update set
+		auth_id = excluded.auth_id,
+		file_name = excluded.file_name,
+		quota_json = excluded.quota_json,
+		refreshed_at_ms = excluded.refreshed_at_ms,
+		updated_at_ms = excluded.updated_at_ms`,
+		snapshot.Provider,
+		snapshot.AuthIndex,
+		snapshot.AuthID,
+		snapshot.FileName,
+		snapshot.QuotaJSON,
+		snapshot.RefreshedAt.UnixMilli(),
+		snapshot.UpdatedAt.UnixMilli(),
+	)
+	if err != nil {
+		return QuotaSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+func (s *Store) QuotaSnapshots(ctx context.Context) ([]QuotaSnapshot, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("usage store is closed")
+	}
+	rows, err := s.db.QueryContext(ctx, `select
+		provider, auth_index, coalesce(auth_id, ''), coalesce(file_name, ''),
+		quota_json, refreshed_at_ms, updated_at_ms
+		from quota_snapshots
+		order by provider, file_name, auth_index`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]QuotaSnapshot, 0)
+	for rows.Next() {
+		var snapshot QuotaSnapshot
+		var refreshedAtMS int64
+		var updatedAtMS int64
+		if err := rows.Scan(
+			&snapshot.Provider,
+			&snapshot.AuthIndex,
+			&snapshot.AuthID,
+			&snapshot.FileName,
+			&snapshot.QuotaJSON,
+			&refreshedAtMS,
+			&updatedAtMS,
+		); err != nil {
+			return nil, err
+		}
+		snapshot.RefreshedAt = time.UnixMilli(refreshedAtMS).UTC()
+		snapshot.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
+		out = append(out, normalizeQuotaSnapshot(snapshot))
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CredentialTokenUsages(ctx context.Context) ([]CredentialTokenUsage, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("usage store is closed")
+	}
+	rows, err := s.db.QueryContext(ctx, `select
+		auth_index,
+		count(*),
+		sum(case when failed = 0 then 1 else 0 end),
+		sum(case when failed != 0 then 1 else 0 end),
+		coalesce(sum(input_tokens), 0),
+		coalesce(sum(output_tokens), 0),
+		coalesce(sum(reasoning_tokens), 0),
+		coalesce(sum(cached_tokens), 0),
+		coalesce(sum(cache_tokens), 0),
+		coalesce(sum(total_tokens), 0),
+		coalesce(max(timestamp_ms), 0)
+		from usage_events
+		where trim(coalesce(auth_index, '')) != ''
+		group by auth_index
+		order by auth_index`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]CredentialTokenUsage, 0)
+	for rows.Next() {
+		var usage CredentialTokenUsage
+		var lastUsedAtMS int64
+		if err := rows.Scan(
+			&usage.AuthIndex,
+			&usage.RequestCount,
+			&usage.SuccessCount,
+			&usage.FailureCount,
+			&usage.InputTokens,
+			&usage.OutputTokens,
+			&usage.ReasoningTokens,
+			&usage.CachedTokens,
+			&usage.CacheTokens,
+			&usage.TotalTokens,
+			&lastUsedAtMS,
+		); err != nil {
+			return nil, err
+		}
+		usage.AuthIndex = strings.TrimSpace(usage.AuthIndex)
+		if lastUsedAtMS > 0 {
+			usage.LastUsedAtMS = lastUsedAtMS
+			usage.LastUsedAt = time.UnixMilli(lastUsedAtMS).UTC().Format(time.RFC3339)
+		}
+		out = append(out, usage)
+	}
+	return out, rows.Err()
+}
+
+func normalizeQuotaSnapshot(snapshot QuotaSnapshot) QuotaSnapshot {
+	now := time.Now().UTC()
+	snapshot.Provider = strings.ToLower(strings.TrimSpace(snapshot.Provider))
+	snapshot.AuthID = strings.TrimSpace(snapshot.AuthID)
+	snapshot.AuthIndex = strings.TrimSpace(snapshot.AuthIndex)
+	snapshot.FileName = strings.TrimSpace(snapshot.FileName)
+	snapshot.QuotaJSON = strings.TrimSpace(snapshot.QuotaJSON)
+	if snapshot.RefreshedAt.IsZero() {
+		snapshot.RefreshedAt = now
+	} else {
+		snapshot.RefreshedAt = snapshot.RefreshedAt.UTC()
+	}
+	if snapshot.UpdatedAt.IsZero() {
+		snapshot.UpdatedAt = now
+	} else {
+		snapshot.UpdatedAt = snapshot.UpdatedAt.UTC()
+	}
+	return snapshot
 }
 
 func BuildPayload(events []Event) Payload {
