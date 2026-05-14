@@ -5,6 +5,9 @@ cli-proxy-api
 # Configuration
 config.yaml
 .env
+.cursor
+.pi
+.trellis
 
 # Generated content
 bin/*
