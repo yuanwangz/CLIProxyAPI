@@ -376,6 +376,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	status, statusMessage, unavailable, nextRetryAfter, statusCode := effectiveAuthFileStatus(auth, time.Now())
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
@@ -383,13 +384,16 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"type":           strings.TrimSpace(auth.Provider),
 		"provider":       strings.TrimSpace(auth.Provider),
 		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
+		"status":         status,
+		"status_message": statusMessage,
 		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
+		"unavailable":    unavailable,
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
 		"size":           int64(0),
+	}
+	if statusCode > 0 {
+		entry["status_code"] = statusCode
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
@@ -418,8 +422,8 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if !auth.LastRefreshedAt.IsZero() {
 		entry["last_refresh"] = auth.LastRefreshedAt
 	}
-	if !auth.NextRetryAfter.IsZero() {
-		entry["next_retry_after"] = auth.NextRetryAfter
+	if !nextRetryAfter.IsZero() {
+		entry["next_retry_after"] = nextRetryAfter
 	}
 	if path != "" {
 		entry["path"] = path
@@ -472,6 +476,33 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		}
 	}
 	return entry
+}
+
+func effectiveAuthFileStatus(auth *coreauth.Auth, now time.Time) (coreauth.Status, string, bool, time.Time, int) {
+	if auth == nil {
+		return coreauth.StatusUnknown, "", false, time.Time{}, 0
+	}
+	status := auth.Status
+	statusMessage := auth.StatusMessage
+	unavailable := auth.Unavailable
+	nextRetryAfter := auth.NextRetryAfter
+	statusCode := 0
+	if auth.LastError != nil {
+		statusCode = auth.LastError.HTTPStatus
+	}
+	if auth.Disabled || status == coreauth.StatusDisabled {
+		return status, statusMessage, unavailable, nextRetryAfter, statusCode
+	}
+	if unavailable && !nextRetryAfter.IsZero() && !nextRetryAfter.After(now) {
+		unavailable = false
+		nextRetryAfter = time.Time{}
+		statusCode = 0
+		if status == coreauth.StatusError {
+			status = coreauth.StatusActive
+			statusMessage = ""
+		}
+	}
+	return status, statusMessage, unavailable, nextRetryAfter, statusCode
 }
 
 func authProjectID(auth *coreauth.Auth) string {
