@@ -969,6 +969,10 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
+	return h.findAuthFile(name)
+}
+
+func (h *Handler) findAuthFile(name string) *coreauth.Auth {
 	if h == nil || h.authManager == nil {
 		return nil
 	}
@@ -1115,6 +1119,56 @@ func (h *Handler) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) err
 	return err
 }
 
+// RefreshAuthFile triggers an immediate refresh for a single auth file.
+func (h *Handler) RefreshAuthFile(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	targetAuth := h.findAuthFile(name)
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	updated, err := h.authManager.RefreshAuth(c.Request.Context(), targetAuth.ID)
+	if err != nil {
+		body := gin.H{"error": fmt.Sprintf("failed to refresh auth: %v", err)}
+		if updated != nil {
+			body["disabled"] = updated.Disabled
+			if entry := h.buildAuthFileEntry(updated); entry != nil {
+				body["file"] = entry
+			}
+		}
+		c.JSON(http.StatusBadGateway, body)
+		return
+	}
+
+	body := gin.H{"status": "ok", "disabled": false}
+	if updated != nil {
+		body["disabled"] = updated.Disabled
+		if entry := h.buildAuthFileEntry(updated); entry != nil {
+			body["file"] = entry
+		}
+	}
+	c.JSON(http.StatusOK, body)
+}
+
 // PatchAuthFileStatus toggles the disabled state of an auth file
 func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	if h.authManager == nil {
@@ -1143,20 +1197,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
-
+	targetAuth := h.findAuthFile(name)
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
@@ -1209,20 +1250,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
-
+	targetAuth := h.findAuthFile(name)
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return

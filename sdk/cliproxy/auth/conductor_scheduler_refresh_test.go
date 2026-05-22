@@ -78,6 +78,12 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 	if updated.LastError.Code != "unauthorized" {
 		t.Fatalf("LastError.Code = %q, want unauthorized", updated.LastError.Code)
 	}
+	if !updated.Disabled {
+		t.Fatal("expected unauthorized refresh failure to disable auth")
+	}
+	if updated.Status != StatusDisabled {
+		t.Fatalf("Status = %q, want %q", updated.Status, StatusDisabled)
+	}
 	if !updated.NextRefreshAfter.IsZero() {
 		t.Fatalf("NextRefreshAfter = %s, want zero for unauthorized refresh failure", updated.NextRefreshAfter)
 	}
@@ -87,6 +93,53 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 	}
 	if _, shouldSchedule := nextRefreshCheckAt(now, updated, time.Second); shouldSchedule {
 		t.Fatal("expected unauthorized auth to be removed from the auto-refresh schedule")
+	}
+}
+
+func TestManager_RefreshAuthSuccessReenablesUnauthorizedDisabledAuth(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "codex"})
+
+	auth := &Auth{
+		ID:            "unauthorized-refresh-recovery",
+		Provider:      "codex",
+		Disabled:      true,
+		Status:        StatusDisabled,
+		StatusMessage: "unauthorized",
+		LastError:     &Error{Code: "unauthorized", Message: "unauthorized", HTTPStatus: http.StatusUnauthorized},
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {
+				Status:         StatusError,
+				StatusMessage:  "unauthorized",
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(30 * time.Minute),
+				LastError:      &Error{Code: "unauthorized", Message: "unauthorized", HTTPStatus: http.StatusUnauthorized},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	updated, errRefresh := manager.RefreshAuth(ctx, auth.ID)
+	if errRefresh != nil {
+		t.Fatalf("refresh auth: %v", errRefresh)
+	}
+	if updated == nil {
+		t.Fatal("expected refreshed auth")
+	}
+	if updated.Disabled {
+		t.Fatal("Disabled = true, want false after successful unauthorized recovery refresh")
+	}
+	if updated.Status != StatusActive {
+		t.Fatalf("Status = %q, want %q", updated.Status, StatusActive)
+	}
+	if updated.LastError != nil {
+		t.Fatalf("LastError = %#v, want nil", updated.LastError)
+	}
+	if state := updated.ModelStates["gpt-5"]; state == nil || !modelStateIsClean(state) {
+		t.Fatalf("model state after refresh = %#v, want clean active state", state)
 	}
 }
 

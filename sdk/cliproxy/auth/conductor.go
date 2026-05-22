@@ -2278,7 +2278,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			auth.Failed++
 		}
 
-		if result.Success {
+		if result.Success && (auth.Disabled || auth.Status == StatusDisabled) {
+			auth.UpdatedAt = now
+		} else if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
@@ -2318,14 +2320,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					} else {
 						switch statusCode {
 						case 401:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "unauthorized"
-								shouldSuspendModel = true
-							}
+							state.NextRetryAfter = time.Time{}
+							state.Quota = QuotaState{}
+							applyUnauthorizedDisabledState(auth, result.Error, now)
+							clearModelQuota = true
 						case 402, 403:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
@@ -2382,9 +2380,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 					}
 
-					auth.Status = StatusError
-					auth.UpdatedAt = now
-					updateAggregatedAvailability(auth, now)
+					if auth.Disabled || auth.Status == StatusDisabled {
+						auth.UpdatedAt = now
+					} else {
+						auth.Status = StatusError
+						auth.UpdatedAt = now
+						updateAggregatedAvailability(auth, now)
+					}
 				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
@@ -2574,6 +2576,78 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
+}
+
+func applyUnauthorizedDisabledState(auth *Auth, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.Disabled = true
+	auth.Unavailable = false
+	auth.Status = StatusDisabled
+	auth.StatusMessage = "unauthorized"
+	auth.NextRetryAfter = time.Time{}
+	auth.NextRefreshAfter = time.Time{}
+	auth.Quota = QuotaState{}
+	auth.UpdatedAt = now
+
+	if resultErr != nil {
+		auth.LastError = cloneError(resultErr)
+	} else {
+		auth.LastError = &Error{}
+	}
+	if auth.LastError.HTTPStatus == 0 {
+		auth.LastError.HTTPStatus = http.StatusUnauthorized
+	}
+	if strings.TrimSpace(auth.LastError.Code) == "" {
+		auth.LastError.Code = "unauthorized"
+	}
+	if strings.TrimSpace(auth.LastError.Message) == "" {
+		auth.LastError.Message = "unauthorized"
+	}
+	auth.LastError.Retryable = false
+}
+
+func shouldEnableAfterUnauthorizedRefresh(auth *Auth) bool {
+	if auth == nil || (!auth.Disabled && auth.Status != StatusDisabled) {
+		return false
+	}
+	return hasUnauthorizedAuthFailure(auth) || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "unauthorized")
+}
+
+func modelStateHasUnauthorizedFailure(state *ModelState) bool {
+	if state == nil {
+		return false
+	}
+	if state.LastError != nil && state.LastError.StatusCode() == http.StatusUnauthorized {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(state.StatusMessage), "unauthorized")
+}
+
+func clearUnauthorizedModelStates(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	for _, state := range auth.ModelStates {
+		if modelStateHasUnauthorizedFailure(state) {
+			resetModelState(state, now)
+		}
+	}
+}
+
+func clearUnauthorizedDisabledStateAfterRefresh(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.Disabled = false
+	clearUnauthorizedModelStates(auth, now)
+	clearAuthStateOnSuccess(auth, now)
+	updateAggregatedAvailability(auth, now)
+	if !auth.Unavailable {
+		auth.Status = StatusActive
+		auth.StatusMessage = ""
+	}
 }
 
 func cloneError(err *Error) *Error {
@@ -2786,12 +2860,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	statusCode := statusCodeFromResult(resultErr)
 	switch statusCode {
 	case 401:
-		auth.StatusMessage = "unauthorized"
-		if disableCooling {
-			auth.NextRetryAfter = time.Time{}
-		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
-		}
+		applyUnauthorizedDisabledState(auth, resultErr, now)
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
 		if disableCooling {
@@ -4141,7 +4210,12 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	return true
 }
 
-func (m *Manager) refreshAuth(ctx context.Context, id string) {
+// RefreshAuth refreshes a single credential immediately.
+func (m *Manager) RefreshAuth(ctx context.Context, id string) (*Auth, error) {
+	return m.refreshAuth(ctx, id)
+}
+
+func (m *Manager) refreshAuth(ctx context.Context, id string) (*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -4154,41 +4228,48 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		cloned = auth.Clone()
 	}
 	m.mu.RUnlock()
-	if auth == nil || exec == nil {
-		return
+	if auth == nil {
+		return nil, errors.New("auth not found")
 	}
+	if exec == nil {
+		return nil, errors.New("auth executor not found")
+	}
+	enableAfterRefresh := shouldEnableAfterUnauthorizedRefresh(cloned)
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		return
+		return nil, err
 	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
 		unauthorized := isUnauthorizedError(err)
 		shouldReschedule := false
+		var snapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.LastError = refreshErrorFromError(err)
+			authErr := refreshErrorFromError(err)
 			if unauthorized {
-				current.NextRefreshAfter = time.Time{}
-				current.Unavailable = true
-				current.Status = StatusError
-				current.StatusMessage = "unauthorized"
+				applyUnauthorizedDisabledState(current, authErr, now)
 			} else {
+				current.LastError = authErr
 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			}
 			m.auths[id] = current
 			shouldReschedule = true
+			snapshot = current.Clone()
 			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
+				m.scheduler.upsertAuth(snapshot)
 			}
 		}
 		m.mu.Unlock()
+		if snapshot != nil {
+			_ = m.persist(ctx, snapshot)
+		}
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}
-		return
+		return snapshot, err
 	}
 	if updated == nil {
 		updated = cloned
@@ -4202,10 +4283,14 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
+	if enableAfterRefresh {
+		clearUnauthorizedDisabledStateAfterRefresh(updated, now)
+	}
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	_, _ = m.Update(ctx, updated)
+	saved, errUpdate := m.Update(ctx, updated)
+	return saved, errUpdate
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
