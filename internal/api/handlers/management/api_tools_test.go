@@ -2,9 +2,13 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -208,5 +212,74 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 	}
 	if gotCompat.ID != compatAuth.ID {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
+	}
+}
+
+func TestAPICallUnauthorizedMarksAuthDisabled(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		http.Error(w, "bad token", http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "api-call-auth",
+		FileName: "api-call.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token": "test-token",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	authIndex := auth.EnsureIndex()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	payload := map[string]any{
+		"auth_index": authIndex,
+		"method":     http.MethodGet,
+		"url":        upstream.URL,
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+		},
+	}
+	body, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		t.Fatalf("marshal payload: %v", errMarshal)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.APICall(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %q after api call", auth.ID)
+	}
+	if !updated.Disabled {
+		t.Fatal("Disabled = false, want true after API call 401")
+	}
+	if updated.Status != coreauth.StatusDisabled {
+		t.Fatalf("Status = %q, want %q", updated.Status, coreauth.StatusDisabled)
+	}
+	if updated.LastError == nil || updated.LastError.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("LastError = %#v, want HTTP 401", updated.LastError)
 	}
 }

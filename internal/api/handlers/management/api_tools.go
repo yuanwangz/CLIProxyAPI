@@ -208,11 +208,32 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	h.markAPICallUnauthorized(c.Request.Context(), auth, resp.StatusCode, respBody)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
+	})
+}
+
+func (h *Handler) markAPICallUnauthorized(ctx context.Context, auth *coreauth.Auth, statusCode int, body []byte) {
+	if h == nil || h.authManager == nil || auth == nil || statusCode != http.StatusUnauthorized {
+		return
+	}
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		message = "unauthorized"
+	}
+	h.authManager.MarkResult(ctx, coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Success:  false,
+		Error: &coreauth.Error{
+			Code:       "unauthorized",
+			Message:    message,
+			HTTPStatus: http.StatusUnauthorized,
+		},
 	})
 }
 
