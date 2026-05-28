@@ -305,6 +305,49 @@ func persist(_ context.Context, auth *cliproxyauth.Auth, state quotaState) {
 		FileName:  fileName,
 		QuotaJSON: string(quotaJSON),
 	})
+	publishRoutingHint(auth, state)
+}
+
+// publishRoutingHint mirrors the earliest observed reset window into the
+// scheduler's provider-neutral routing hint map. Reuses already-parsed
+// state; no extra header parsing and no network work.
+func publishRoutingHint(auth *cliproxyauth.Auth, state quotaState) {
+	if auth == nil {
+		return
+	}
+	publishRoutingHintByAuthID(strings.TrimSpace(auth.ID), state)
+}
+
+func publishRoutingHintByAuthID(authID string, state quotaState) {
+	if authID == "" {
+		return
+	}
+	var (
+		bestResetUnix int64
+		bestWindow    time.Duration
+		found         bool
+	)
+	for _, window := range state.Windows {
+		if window.ResetAt == nil || *window.ResetAt <= 0 {
+			continue
+		}
+		if !found || *window.ResetAt < bestResetUnix {
+			bestResetUnix = *window.ResetAt
+			if window.WindowMinutes != nil && *window.WindowMinutes > 0 {
+				bestWindow = time.Duration(*window.WindowMinutes) * time.Minute
+			} else {
+				bestWindow = 0
+			}
+			found = true
+		}
+	}
+	if !found {
+		return
+	}
+	cliproxyauth.SetQuotaRoutingHint(authID, cliproxyauth.QuotaRoutingHint{
+		ResetAt: time.Unix(bestResetUnix, 0).UTC(),
+		Window:  bestWindow,
+	})
 }
 
 func hasRateLimitData(snapshot rateLimitSnapshot) bool {

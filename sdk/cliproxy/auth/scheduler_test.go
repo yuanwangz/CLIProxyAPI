@@ -560,3 +560,112 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
 	}
 }
+
+func TestSchedulerPick_FillFirstPrefersNearestQuotaReset(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("auth-near")
+		ClearQuotaRoutingHintForTest("auth-mid")
+		ClearQuotaRoutingHintForTest("auth-far")
+	})
+
+	now := time.Now()
+	SetQuotaRoutingHint("auth-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour), Window: 5 * time.Hour})
+	SetQuotaRoutingHint("auth-mid", QuotaRoutingHint{ResetAt: now.Add(2 * time.Hour), Window: 5 * time.Hour})
+	SetQuotaRoutingHint("auth-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute), Window: 5 * time.Hour})
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "auth-far", Provider: "codex"},
+		&Auth{ID: "auth-mid", Provider: "codex"},
+		&Auth{ID: "auth-near", Provider: "codex"},
+	)
+
+	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle error = %v", err)
+	}
+	if got == nil || got.ID != "auth-near" {
+		t.Fatalf("FillFirst auth.ID = %v, want auth-near", got)
+	}
+}
+
+func TestSchedulerPick_RoundRobinStartsFromNearestQuotaReset(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("rr-near")
+		ClearQuotaRoutingHintForTest("rr-mid")
+		ClearQuotaRoutingHintForTest("rr-far")
+	})
+
+	now := time.Now()
+	SetQuotaRoutingHint("rr-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour)})
+	SetQuotaRoutingHint("rr-mid", QuotaRoutingHint{ResetAt: now.Add(2 * time.Hour)})
+	SetQuotaRoutingHint("rr-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute)})
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "rr-far", Provider: "codex"},
+		&Auth{ID: "rr-mid", Provider: "codex"},
+		&Auth{ID: "rr-near", Provider: "codex"},
+	)
+
+	want := []string{"rr-near", "rr-mid", "rr-far"}
+	for i, wantID := range want {
+		got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if err != nil {
+			t.Fatalf("pickSingle #%d error = %v", i, err)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle #%d auth.ID = %v, want %q", i, got, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_NoQuotaHintMatchesPriorAlphabeticOrder(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("plain-a")
+		ClearQuotaRoutingHintForTest("plain-b")
+		ClearQuotaRoutingHintForTest("plain-c")
+	})
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "plain-c", Provider: "codex"},
+		&Auth{ID: "plain-a", Provider: "codex"},
+		&Auth{ID: "plain-b", Provider: "codex"},
+	)
+
+	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle error = %v", err)
+	}
+	if got == nil || got.ID != "plain-a" {
+		t.Fatalf("no-hint FillFirst auth.ID = %v, want plain-a", got)
+	}
+}
+
+func TestSchedulerPick_QuotaHintOnlyReordersWithinPriorityBucket(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("low-near")
+		ClearQuotaRoutingHintForTest("high-far")
+	})
+
+	now := time.Now()
+	// Low-priority auth has the nearest reset but should still lose to the
+	// high-priority auth because manual priority outranks routing hints.
+	SetQuotaRoutingHint("low-near", QuotaRoutingHint{ResetAt: now.Add(10 * time.Minute)})
+	SetQuotaRoutingHint("high-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour)})
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "low-near", Provider: "codex", Attributes: map[string]string{"priority": "0"}},
+		&Auth{ID: "high-far", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+	)
+
+	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle error = %v", err)
+	}
+	if got == nil || got.ID != "high-far" {
+		t.Fatalf("manual priority must outrank quota hint: got = %v, want high-far", got)
+	}
+}

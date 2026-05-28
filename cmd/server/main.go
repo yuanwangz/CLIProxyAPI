@@ -20,6 +20,7 @@ import (
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cmd"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexquota"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -490,6 +491,7 @@ func main() {
 	if errUsage := usagepersist.Init(usagepersist.DefaultDBPath(wd, writableBase), cfg.UsageStatisticsEnabled); errUsage != nil {
 		log.WithError(errUsage).Warn("failed to initialize usage persistence")
 	}
+	codexquota.WarmupRoutingHints(context.Background())
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {

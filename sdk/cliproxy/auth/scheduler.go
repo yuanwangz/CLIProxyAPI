@@ -971,6 +971,7 @@ func buildReadyView(entries []*scheduledAuth) readyView {
 	if len(entries) == 0 {
 		return view
 	}
+	sortByQuotaRoutingHint(view.flat)
 	groups := make(map[string][]*scheduledAuth)
 	for _, entry := range entries {
 		if entry == nil || entry.meta == nil || entry.meta.virtualParent == "" {
@@ -988,9 +989,46 @@ func buildReadyView(entries []*scheduledAuth) readyView {
 	}
 	sort.Strings(view.parentOrder)
 	for _, parent := range view.parentOrder {
-		view.children[parent] = &childBucket{items: append([]*scheduledAuth(nil), groups[parent]...)}
+		items := append([]*scheduledAuth(nil), groups[parent]...)
+		sortByQuotaRoutingHint(items)
+		view.children[parent] = &childBucket{items: items}
 	}
 	return view
+}
+
+// quotaRoutingFarFuture is the sort key used for entries that carry no usable
+// quota routing hint. It is far enough in the future to push them after any
+// observed reset moment while remaining well below time.Time's overflow
+// boundary.
+var quotaRoutingFarFuture = time.Unix(1<<62, 0)
+
+// sortByQuotaRoutingHint reorders entries so that auths whose next quota
+// reset is the nearest sit at the front. Stable sort preserves the prior
+// order (alphabetic by auth.ID) for entries with no hint, so behavior is
+// identical to the legacy ordering when no hints have been observed.
+func sortByQuotaRoutingHint(entries []*scheduledAuth) {
+	if len(entries) < 2 {
+		return
+	}
+	now := time.Now()
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entryQuotaResetKey(entries[i], now).Before(entryQuotaResetKey(entries[j], now))
+	})
+}
+
+func entryQuotaResetKey(entry *scheduledAuth, now time.Time) time.Time {
+	if entry == nil || entry.auth == nil {
+		return quotaRoutingFarFuture
+	}
+	hint, ok := GetQuotaRoutingHint(entry.auth.ID)
+	if !ok {
+		return quotaRoutingFarFuture
+	}
+	next := EffectiveNextReset(hint, now)
+	if next.IsZero() {
+		return quotaRoutingFarFuture
+	}
+	return next
 }
 
 // pickFirst returns the first ready entry that satisfies predicate without advancing cursors.
