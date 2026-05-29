@@ -1020,15 +1020,7 @@ func entryQuotaResetKey(entry *scheduledAuth, now time.Time) time.Time {
 	if entry == nil || entry.auth == nil {
 		return quotaRoutingFarFuture
 	}
-	hint, ok := GetQuotaRoutingHint(entry.auth.ID)
-	if !ok {
-		return quotaRoutingFarFuture
-	}
-	next := EffectiveNextReset(hint, now)
-	if next.IsZero() {
-		return quotaRoutingFarFuture
-	}
-	return next
+	return authQuotaResetKey(entry.auth, now)
 }
 
 // pickFirst returns the first ready entry that satisfies predicate without advancing cursors.

@@ -250,8 +250,34 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	available := availableByPriority[bestPriority]
 	if len(available) > 1 {
 		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+		sortAuthsByQuotaRoutingHint(available)
 	}
 	return available, nil
+}
+
+func sortAuthsByQuotaRoutingHint(auths []*Auth) {
+	if len(auths) < 2 {
+		return
+	}
+	now := time.Now()
+	sort.SliceStable(auths, func(i, j int) bool {
+		return authQuotaResetKey(auths[i], now).Before(authQuotaResetKey(auths[j], now))
+	})
+}
+
+func authQuotaResetKey(auth *Auth, now time.Time) time.Time {
+	if auth == nil {
+		return quotaRoutingFarFuture
+	}
+	hint, ok := GetQuotaRoutingHint(auth.ID)
+	if !ok {
+		return quotaRoutingFarFuture
+	}
+	next := EffectiveNextReset(hint, now)
+	if next.IsZero() {
+		return quotaRoutingFarFuture
+	}
+	return next
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.

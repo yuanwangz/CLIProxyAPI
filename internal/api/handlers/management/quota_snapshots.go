@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexquota"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagepersist"
 )
 
@@ -88,6 +89,7 @@ func (h *Handler) PutQuotaSnapshot(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errUpsert.Error()})
 		return
 	}
+	codexquota.PublishRoutingHintFromSnapshot(snapshot.Provider, snapshot.AuthID, snapshot.QuotaJSON)
 
 	c.JSON(http.StatusOK, quotaSnapshotToResponse(snapshot))
 }

@@ -171,6 +171,29 @@ func TestPublishRoutingHint_LatestObservationOverwritesEarlier(t *testing.T) {
 	}
 }
 
+func TestPublishRoutingHintFromSnapshot_PublishesCodexSnapshot(t *testing.T) {
+	const authID = "codex-hint-snapshot"
+	t.Cleanup(func() { cliproxyauth.ClearQuotaRoutingHintForTest(authID) })
+
+	resetUnix := time.Now().Add(45 * time.Minute).Unix()
+	quotaJSON := `{"status":"success","windows":[{"id":"weekly","resetAt":` +
+		strconv.FormatInt(resetUnix, 10) + `,"windowMinutes":10080}]}`
+
+	if ok := PublishRoutingHintFromSnapshot(providerCodex, authID, quotaJSON); !ok {
+		t.Fatalf("expected snapshot to publish routing hint")
+	}
+	hint, ok := cliproxyauth.GetQuotaRoutingHint(authID)
+	if !ok {
+		t.Fatalf("expected routing hint to be present")
+	}
+	if !hint.ResetAt.Equal(time.Unix(resetUnix, 0).UTC()) {
+		t.Fatalf("ResetAt = %v, want %v", hint.ResetAt, time.Unix(resetUnix, 0).UTC())
+	}
+	if hint.Window != 7*24*time.Hour {
+		t.Fatalf("Window = %v, want 168h", hint.Window)
+	}
+}
+
 func TestWarmupRoutingHints_PrimesFromPersistedSnapshots(t *testing.T) {
 	const authID = "codex-warmup-1"
 	t.Cleanup(func() { cliproxyauth.ClearQuotaRoutingHintForTest(authID) })

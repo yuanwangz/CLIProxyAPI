@@ -100,6 +100,30 @@ func PersistFromEvent(ctx context.Context, auth *cliproxyauth.Auth, payload []by
 	persist(ctx, auth, state)
 }
 
+// PublishRoutingHintFromSnapshot mirrors a stored Codex quota snapshot into the
+// scheduler's in-memory routing hint map. It is intended for management writes
+// that already persisted a successful snapshot and should affect routing
+// immediately without waiting for a service restart.
+func PublishRoutingHintFromSnapshot(provider, authID, quotaJSON string) bool {
+	if !strings.EqualFold(strings.TrimSpace(provider), providerCodex) {
+		return false
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return false
+	}
+	raw := strings.TrimSpace(quotaJSON)
+	if raw == "" {
+		return false
+	}
+	var state quotaState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		log.WithError(err).WithField("auth_id", authID).Debug("codex routing hint: invalid quota_json")
+		return false
+	}
+	return publishRoutingHintByAuthID(authID, state)
+}
+
 func quotaStateFromHeaders(headers http.Header) (quotaState, bool) {
 	snapshots := parseAllHeaderRateLimits(headers)
 	return quotaStateFromSnapshots(snapshots, "headers")
@@ -311,16 +335,16 @@ func persist(_ context.Context, auth *cliproxyauth.Auth, state quotaState) {
 // publishRoutingHint mirrors the earliest observed reset window into the
 // scheduler's provider-neutral routing hint map. Reuses already-parsed
 // state; no extra header parsing and no network work.
-func publishRoutingHint(auth *cliproxyauth.Auth, state quotaState) {
+func publishRoutingHint(auth *cliproxyauth.Auth, state quotaState) bool {
 	if auth == nil {
-		return
+		return false
 	}
-	publishRoutingHintByAuthID(strings.TrimSpace(auth.ID), state)
+	return publishRoutingHintByAuthID(strings.TrimSpace(auth.ID), state)
 }
 
-func publishRoutingHintByAuthID(authID string, state quotaState) {
+func publishRoutingHintByAuthID(authID string, state quotaState) bool {
 	if authID == "" {
-		return
+		return false
 	}
 	var (
 		bestResetUnix int64
@@ -342,12 +366,13 @@ func publishRoutingHintByAuthID(authID string, state quotaState) {
 		}
 	}
 	if !found {
-		return
+		return false
 	}
 	cliproxyauth.SetQuotaRoutingHint(authID, cliproxyauth.QuotaRoutingHint{
 		ResetAt: time.Unix(bestResetUnix, 0).UTC(),
 		Window:  bestWindow,
 	})
+	return true
 }
 
 func hasRateLimitData(snapshot rateLimitSnapshot) bool {

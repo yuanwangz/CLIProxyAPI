@@ -89,6 +89,37 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	}
 }
 
+func TestRoundRobinSelectorPick_StartsFromNearestQuotaReset(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("selector-near")
+		ClearQuotaRoutingHintForTest("selector-mid")
+		ClearQuotaRoutingHintForTest("selector-far")
+	})
+
+	now := time.Now()
+	SetQuotaRoutingHint("selector-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour)})
+	SetQuotaRoutingHint("selector-mid", QuotaRoutingHint{ResetAt: now.Add(2 * time.Hour)})
+	SetQuotaRoutingHint("selector-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute)})
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "selector-far", Provider: "codex"},
+		{ID: "selector-mid", Provider: "codex"},
+		{ID: "selector-near", Provider: "codex"},
+	}
+
+	want := []string{"selector-near", "selector-mid", "selector-far"}
+	for i, wantID := range want {
+		got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("Pick() #%d auth.ID = %v, want %q", i, got, wantID)
+		}
+	}
+}
+
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 
