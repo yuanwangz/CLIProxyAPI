@@ -26,6 +26,7 @@ Go 1.26+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with 
 - Add or keep tests around fork-owned behavior so merge regressions are caught before deployment.
 
 ### Recent Upstream Sync Notes
+- 2026-06-01: merged upstream `main` through `05b97247` (`v7.1.37`). Conflict resolution kept fork GPT 5.5/static model catalog tests while adding upstream xAI `grok-imagine-video-1.5-preview` coverage. Upstream introduced Codex identity obfuscation refinements, signature replay compatibility checks, Home app log forwarding, and model registry updates. Keep `setHeaderCasePreserved` updating an existing case-equivalent key instead of recreating it, so HTTP Codex requests retain `Session_id` while WebSocket requests retain lowercase `session_id`.
 - 2026-05-29: merged upstream `main` through `df0176a1`. Conflict resolutions kept fork-owned auth status/cooldown visibility, Codex quota persistence from WebSocket handshakes/events, image fallback usage event publishing, and Antigravity credits hints while preserving upstream service-tier/TTFT usage tracking, websocket auth metadata, request logging, signature validation extraction, and model registry updates. Keep Antigravity credits `loadCodeAssist` defaulting to the daily endpoint unless a custom `base_url` is configured, and keep bootstrap retry auth-selection errors surfaced as `auth_unavailable` after an upstream bootstrap failure.
 
 ### Fork-Owned Backend Features
