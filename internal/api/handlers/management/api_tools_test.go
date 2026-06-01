@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -215,7 +216,7 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 	}
 }
 
-func TestAPICallUnauthorizedMarksAuthDisabled(t *testing.T) {
+func TestAPICallUnauthorizedFromUntrustedHostDoesNotDisableAuth(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -273,8 +274,137 @@ func TestAPICallUnauthorizedMarksAuthDisabled(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected auth %q after api call", auth.ID)
 	}
+	if updated.Disabled {
+		t.Fatal("Disabled = true, want false after local API call 401")
+	}
+	if updated.Status == coreauth.StatusDisabled {
+		t.Fatalf("Status = %q, want non-disabled after local API call 401", updated.Status)
+	}
+	if updated.LastError != nil {
+		t.Fatalf("LastError = %#v, want nil after local API call 401", updated.LastError)
+	}
+}
+
+func TestShouldMarkAPICallUnauthorizedRequiresInjectedTokenAndTrustedProviderURL(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		provider      string
+		rawURL        string
+		tokenInjected bool
+		want          bool
+	}{
+		{
+			name:          "codex chatgpt trusted",
+			provider:      "codex",
+			rawURL:        "https://chatgpt.com/backend-api/wham/usage",
+			tokenInjected: true,
+			want:          true,
+		},
+		{
+			name:          "openai api trusted",
+			provider:      "openai",
+			rawURL:        "https://api.openai.com/v1/responses",
+			tokenInjected: true,
+			want:          true,
+		},
+		{
+			name:          "codex without injected token",
+			provider:      "codex",
+			rawURL:        "https://chatgpt.com/backend-api/wham/usage",
+			tokenInjected: false,
+			want:          false,
+		},
+		{
+			name:          "codex http rejected",
+			provider:      "codex",
+			rawURL:        "http://chatgpt.com/backend-api/wham/usage",
+			tokenInjected: true,
+			want:          false,
+		},
+		{
+			name:          "codex local management rejected",
+			provider:      "codex",
+			rawURL:        "https://127.0.0.1/v0/management/api-call",
+			tokenInjected: true,
+			want:          false,
+		},
+		{
+			name:          "claude trusted",
+			provider:      "claude",
+			rawURL:        "https://api.anthropic.com/v1/organizations/usage_report/messages",
+			tokenInjected: true,
+			want:          true,
+		},
+		{
+			name:          "gemini trusted",
+			provider:      "gemini-cli",
+			rawURL:        "https://cloudcode-pa.googleapis.com/v1internal:countTokens",
+			tokenInjected: true,
+			want:          true,
+		},
+		{
+			name:          "kimi trusted",
+			provider:      "kimi",
+			rawURL:        "https://api.kimi.com/v1/users/me",
+			tokenInjected: true,
+			want:          true,
+		},
+		{
+			name:          "xai trusted",
+			provider:      "xai",
+			rawURL:        "https://cli-chat-proxy.grok.com/v1/me",
+			tokenInjected: true,
+			want:          true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			parsedURL, errParse := url.Parse(tc.rawURL)
+			if errParse != nil {
+				t.Fatalf("parse url: %v", errParse)
+			}
+			auth := &coreauth.Auth{Provider: tc.provider}
+			got := shouldMarkAPICallUnauthorized(auth, parsedURL, tc.tokenInjected)
+			if got != tc.want {
+				t.Fatalf("shouldMarkAPICallUnauthorized() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAPICallUnauthorizedFromTrustedProviderMarksAuthDisabled(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "trusted-api-call-auth",
+		FileName: "trusted-api-call.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := &Handler{authManager: manager}
+	requestURL, errParse := url.Parse("https://chatgpt.com/backend-api/wham/usage")
+	if errParse != nil {
+		t.Fatalf("parse url: %v", errParse)
+	}
+	h.markAPICallUnauthorized(context.Background(), auth, http.StatusUnauthorized, []byte("bad token"), requestURL, true)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %q after trusted api call", auth.ID)
+	}
 	if !updated.Disabled {
-		t.Fatal("Disabled = false, want true after API call 401")
+		t.Fatal("Disabled = false, want true after trusted provider API call 401")
 	}
 	if updated.Status != coreauth.StatusDisabled {
 		t.Fatalf("Status = %q, want %q", updated.Status, coreauth.StatusDisabled)

@@ -83,6 +83,8 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
+	fileInfo, _ := os.Stat(fullPath)
+	createdAt := coreauth.CredentialCreatedAt(metadata, fileInfo, now)
 	label := provider
 	if email, _ := metadata["email"].(string); email != "" {
 		label = email
@@ -134,7 +136,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		},
 		ProxyURL:  proxyURL,
 		Metadata:  metadata,
-		CreatedAt: now,
+		CreatedAt: createdAt,
 		UpdatedAt: now,
 	}
 	// Read priority from auth file.
@@ -158,6 +160,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
+	coreauth.RestoreAuthStateFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {

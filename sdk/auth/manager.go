@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -56,6 +57,9 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 	}
 	if record == nil {
 		return nil, "", fmt.Errorf("cliproxy auth: authenticator %s returned nil record", provider)
+	}
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = time.Now().UTC()
 	}
 
 	if m.store == nil {

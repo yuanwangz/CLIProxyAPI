@@ -73,9 +73,7 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected uploaded file %s to exist: %v", file.name, err)
 		}
-		if string(data) != file.content {
-			t.Fatalf("expected file %s content %q, got %q", file.name, file.content, string(data))
-		}
+		assertAuthFileContainsUploadedFields(t, file.name, data, file.content)
 	}
 
 	auths := manager.List()
@@ -145,8 +143,27 @@ func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t
 	if err != nil {
 		t.Fatalf("expected valid auth file to be created: %v", err)
 	}
-	if string(betaData) != files[1].content {
-		t.Fatalf("expected beta auth file content %q, got %q", files[1].content, string(betaData))
+	assertAuthFileContainsUploadedFields(t, "beta.json", betaData, files[1].content)
+}
+
+func assertAuthFileContainsUploadedFields(t *testing.T, name string, data []byte, uploaded string) {
+	t.Helper()
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("expected file %s to contain JSON, got %q: %v", name, string(data), err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal([]byte(uploaded), &want); err != nil {
+		t.Fatalf("invalid uploaded fixture for %s: %v", name, err)
+	}
+	for key, wantValue := range want {
+		if gotValue, ok := got[key]; !ok || gotValue != wantValue {
+			t.Fatalf("expected file %s field %q=%#v, got %#v in %q", name, key, wantValue, gotValue, string(data))
+		}
+	}
+	if createdAt, _ := got["credential_created_at"].(string); createdAt == "" {
+		t.Fatalf("expected file %s to include credential_created_at, got %q", name, string(data))
 	}
 }
 

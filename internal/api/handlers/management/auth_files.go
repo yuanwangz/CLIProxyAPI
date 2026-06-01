@@ -325,11 +325,20 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			continue
 		}
 		if info, errInfo := e.Info(); errInfo == nil {
-			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
+			fileData := gin.H{
+				"name":       name,
+				"size":       info.Size(),
+				"modtime":    info.ModTime(),
+				"created_at": coreauth.FileInfoCreatedAt(info),
+			}
 
 			// Read file to get type field
 			full := filepath.Join(h.cfg.AuthDir, name)
 			if data, errRead := os.ReadFile(full); errRead == nil {
+				var metadata map[string]any
+				if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal == nil {
+					fileData["created_at"] = coreauth.CredentialCreatedAt(metadata, info, info.ModTime())
+				}
 				typeValue := gjson.GetBytes(data, "type").String()
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
@@ -908,6 +917,11 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err != nil {
 		return err
 	}
+	coreauth.SyncAuthStateToMetadata(auth)
+	data, err = json.Marshal(auth.Metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal auth file: %w", err)
+	}
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
@@ -1095,6 +1109,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if path == "" {
 		return nil, fmt.Errorf("auth path is empty")
 	}
+	loadedFromDisk := data == nil
 	if data == nil {
 		var err error
 		data, err = os.ReadFile(path)
@@ -1124,6 +1139,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		"path":   path,
 		"source": path,
 	}
+	now := time.Now().UTC()
 	auth := &coreauth.Auth{
 		ID:         authID,
 		Provider:   provider,
@@ -1132,15 +1148,14 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		Status:     coreauth.StatusActive,
 		Attributes: attr,
 		Metadata:   metadata,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
 	if h != nil && h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(authID); ok {
-			auth.CreatedAt = existing.CreatedAt
 			if !hasLastRefresh {
 				auth.LastRefreshedAt = existing.LastRefreshedAt
 			}
@@ -1148,7 +1163,13 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 			auth.Runtime = existing.Runtime
 		}
 	}
+	if loadedFromDisk {
+		auth.CreatedAt = coreauth.ResolveCredentialCreatedAtFromFile(path, auth.CreatedAt)
+	} else if createdAt, ok := coreauth.CredentialCreatedAtFromMetadata(metadata); ok {
+		auth.CreatedAt = createdAt
+	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	coreauth.RestoreAuthStateFromMetadata(auth)
 	return auth, nil
 }
 
@@ -1157,7 +1178,9 @@ func (h *Handler) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) err
 		return nil
 	}
 	if existing, ok := h.authManager.GetByID(auth.ID); ok {
-		auth.CreatedAt = existing.CreatedAt
+		if auth.CreatedAt.IsZero() {
+			auth.CreatedAt = existing.CreatedAt
+		}
 		_, err := h.authManager.Update(ctx, auth)
 		return err
 	}
@@ -1251,6 +1274,9 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 
 	// Update disabled state
 	targetAuth.Disabled = *req.Disabled
+	targetAuth.Unavailable = false
+	targetAuth.LastError = nil
+	targetAuth.NextRetryAfter = time.Time{}
 	if *req.Disabled {
 		targetAuth.Status = coreauth.StatusDisabled
 		targetAuth.StatusMessage = "disabled via management API"
@@ -1686,6 +1712,9 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
+	}
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = time.Now().UTC()
 	}
 	return store.Save(ctx, record)
 }

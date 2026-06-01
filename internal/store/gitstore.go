@@ -287,10 +287,7 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 
 	switch {
 	case auth.Storage != nil:
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
-		}
-		auth.Metadata["disabled"] = auth.Disabled
+		cliproxyauth.PrepareAuthMetadataForSave(auth, path)
 		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
@@ -298,7 +295,7 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 			return "", err
 		}
 	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
+		cliproxyauth.PrepareAuthMetadataForSave(auth, path)
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
@@ -488,7 +485,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		Status:           cliproxyauth.StatusActive,
 		Attributes:       map[string]string{"path": path},
 		Metadata:         metadata,
-		CreatedAt:        info.ModTime(),
+		CreatedAt:        cliproxyauth.CredentialCreatedAt(metadata, info, info.ModTime()),
 		UpdatedAt:        info.ModTime(),
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
@@ -501,6 +498,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		auth.Disabled = true
 		auth.Status = cliproxyauth.StatusDisabled
 	}
+	cliproxyauth.RestoreAuthStateFromMetadata(auth)
 	return auth, nil
 }
 

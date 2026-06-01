@@ -1169,6 +1169,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
 		}
+		if auth.CreatedAt.IsZero() {
+			auth.CreatedAt = existing.CreatedAt
+		}
 		auth.Success = existing.Success
 		auth.Failed = existing.Failed
 		auth.recentRequests = existing.recentRequests

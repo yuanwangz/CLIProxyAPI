@@ -141,6 +141,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	var hostOverride string
 	var token string
 	var tokenResolved bool
+	var tokenInjected bool
 	var tokenErr error
 	for key, value := range reqHeaders {
 		if !strings.Contains(value, "$TOKEN$") {
@@ -162,6 +163,7 @@ func (h *Handler) APICall(c *gin.Context) {
 			continue
 		}
 		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
+		tokenInjected = true
 	}
 
 	var requestBody io.Reader
@@ -208,7 +210,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
-	h.markAPICallUnauthorized(c.Request.Context(), auth, resp.StatusCode, respBody)
+	h.markAPICallUnauthorized(c.Request.Context(), auth, resp.StatusCode, respBody, req.URL, tokenInjected)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
@@ -217,8 +219,11 @@ func (h *Handler) APICall(c *gin.Context) {
 	})
 }
 
-func (h *Handler) markAPICallUnauthorized(ctx context.Context, auth *coreauth.Auth, statusCode int, body []byte) {
+func (h *Handler) markAPICallUnauthorized(ctx context.Context, auth *coreauth.Auth, statusCode int, body []byte, requestURL *url.URL, tokenInjected bool) {
 	if h == nil || h.authManager == nil || auth == nil || statusCode != http.StatusUnauthorized {
+		return
+	}
+	if !shouldMarkAPICallUnauthorized(auth, requestURL, tokenInjected) {
 		return
 	}
 	message := strings.TrimSpace(string(body))
@@ -235,6 +240,41 @@ func (h *Handler) markAPICallUnauthorized(ctx context.Context, auth *coreauth.Au
 			HTTPStatus: http.StatusUnauthorized,
 		},
 	})
+}
+
+func shouldMarkAPICallUnauthorized(auth *coreauth.Auth, requestURL *url.URL, tokenInjected bool) bool {
+	if auth == nil || requestURL == nil || !tokenInjected {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(requestURL.Scheme), "https") {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(requestURL.Hostname()))
+	if host == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "codex", "openai":
+		return apiCallHostMatches(host, "chatgpt.com") || host == "api.openai.com"
+	case "claude", "anthropic":
+		return host == "api.anthropic.com"
+	case "gemini", "gemini-cli", "antigravity":
+		return host == "cloudcode-pa.googleapis.com" ||
+			host == "daily-cloudcode-pa.googleapis.com" ||
+			host == "daily-cloudcode-pa.sandbox.googleapis.com"
+	case "kimi":
+		return host == "api.kimi.com"
+	case "xai", "grok":
+		return host == "cli-chat-proxy.grok.com"
+	default:
+		return false
+	}
+}
+
+func apiCallHostMatches(host, suffix string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	suffix = strings.ToLower(strings.TrimSpace(suffix))
+	return host == suffix || strings.HasSuffix(host, "."+suffix)
 }
 
 func firstNonEmptyString(values ...*string) string {

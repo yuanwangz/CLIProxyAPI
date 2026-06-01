@@ -2,6 +2,7 @@ package synthesizer
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,6 +129,62 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 	if auths[0].Status != coreauth.StatusActive {
 		t.Errorf("expected status active, got %s", auths[0].Status)
+	}
+}
+
+func TestFileSynthesizer_Synthesize_RestoresCredentialCreatedAtAndUnauthorizedState(t *testing.T) {
+	tempDir := t.TempDir()
+
+	createdAt := time.Date(2026, time.February, 3, 4, 5, 6, 123456789, time.UTC)
+	authData := map[string]any{
+		"type":                  "codex",
+		"email":                 "codex@example.com",
+		"disabled":              true,
+		"status_message":        "unauthorized",
+		"credential_created_at": createdAt.Format(time.RFC3339Nano),
+		"last_error": map[string]any{
+			"code":        "unauthorized",
+			"message":     "token refresh failed with status 401",
+			"http_status": http.StatusUnauthorized,
+		},
+	}
+	data, _ := json.Marshal(authData)
+	authPath := filepath.Join(tempDir, "codex-auth.json")
+	if err := os.WriteFile(authPath, data, 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+	later := createdAt.Add(72 * time.Hour)
+	if err := os.Chtimes(authPath, later, later); err != nil {
+		t.Fatalf("change auth file times: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         later,
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	got := auths[0]
+	if !got.CreatedAt.Equal(createdAt) {
+		t.Fatalf("CreatedAt=%s, want %s", got.CreatedAt.Format(time.RFC3339Nano), createdAt.Format(time.RFC3339Nano))
+	}
+	if !got.Disabled {
+		t.Fatal("Disabled=false, want true")
+	}
+	if got.Status != coreauth.StatusDisabled {
+		t.Fatalf("Status=%q, want %q", got.Status, coreauth.StatusDisabled)
+	}
+	if got.LastError == nil || got.LastError.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("LastError=%#v, want HTTP 401", got.LastError)
 	}
 }
 
