@@ -350,6 +350,82 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	}
 }
 
+// ClearQuotaCooldownState clears transient quota/429 runtime cooldowns for one
+// auth after an explicit management quota refresh proves capacity is available.
+func (m *Manager) ClearQuotaCooldownState(ctx context.Context, authID string) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+
+	authID = strings.TrimSpace(authID)
+	now := time.Now()
+	clearedModels := make([]string, 0)
+	var snapshot *Auth
+
+	m.mu.Lock()
+	auth, ok := m.auths[authID]
+	if ok && auth != nil && !auth.Disabled && auth.Status != StatusDisabled {
+		changed := false
+
+		if authHasQuotaCooldown(auth) {
+			auth.Quota = QuotaState{}
+			auth.NextRetryAfter = time.Time{}
+			auth.Unavailable = false
+			if errorIsQuotaCooldown(auth.LastError) {
+				auth.LastError = nil
+			}
+			if statusMessageIsQuotaCooldown(auth.StatusMessage) {
+				auth.StatusMessage = ""
+			}
+			changed = true
+		}
+
+		for modelKey, state := range auth.ModelStates {
+			if !modelStateHasQuotaCooldown(state) {
+				continue
+			}
+			resetModelState(state, now)
+			clearedModels = append(clearedModels, strings.TrimSpace(modelKey))
+			if modelStateIsClean(state) {
+				delete(auth.ModelStates, modelKey)
+			}
+			changed = true
+		}
+
+		if changed {
+			if len(auth.ModelStates) == 0 {
+				auth.ModelStates = nil
+				clearAggregatedAvailability(auth)
+			} else {
+				updateAggregatedAvailability(auth, now)
+			}
+			if !hasModelError(auth, now) && auth.LastError == nil {
+				auth.StatusMessage = ""
+				auth.Status = StatusActive
+			}
+			auth.UpdatedAt = now
+			if errPersist := m.persist(ctx, auth); errPersist != nil {
+				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes while clearing quota cooldown: %v", errPersist)
+			}
+			snapshot = auth.Clone()
+		}
+	}
+	m.mu.Unlock()
+
+	if snapshot == nil {
+		return
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	for _, model := range clearedModels {
+		if model != "" {
+			registry.GetGlobalRegistry().ClearModelQuotaExceeded(authID, model)
+		}
+	}
+	m.hook.OnAuthUpdated(ctx, snapshot.Clone())
+}
+
 func (m *Manager) SetSelector(selector Selector) {
 	if m == nil {
 		return
@@ -2500,6 +2576,65 @@ func modelStateIsClean(state *ModelState) bool {
 		return false
 	}
 	return true
+}
+
+func authHasQuotaCooldown(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if quotaStateHasCooldown(auth.Quota) {
+		return true
+	}
+	if errorIsQuotaCooldown(auth.LastError) {
+		return true
+	}
+	return statusMessageIsQuotaCooldown(auth.StatusMessage)
+}
+
+func modelStateHasQuotaCooldown(state *ModelState) bool {
+	if state == nil {
+		return false
+	}
+	if quotaStateHasCooldown(state.Quota) {
+		return true
+	}
+	if errorIsQuotaCooldown(state.LastError) {
+		return true
+	}
+	return statusMessageIsQuotaCooldown(state.StatusMessage)
+}
+
+func quotaStateHasCooldown(quota QuotaState) bool {
+	return quota.Exceeded ||
+		strings.EqualFold(strings.TrimSpace(quota.Reason), "quota") ||
+		!quota.NextRecoverAt.IsZero() ||
+		quota.BackoffLevel > 0
+}
+
+func errorIsQuotaCooldown(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if err.StatusCode() == http.StatusTooManyRequests {
+		return true
+	}
+	return quotaTextIndicatesCooldown(err.Code) || quotaTextIndicatesCooldown(err.Message)
+}
+
+func statusMessageIsQuotaCooldown(message string) bool {
+	return quotaTextIndicatesCooldown(message)
+}
+
+func quotaTextIndicatesCooldown(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return false
+	}
+	return strings.Contains(normalized, "quota") ||
+		strings.Contains(normalized, "rate limit") ||
+		strings.Contains(normalized, "rate_limit") ||
+		strings.Contains(normalized, "limit reached") ||
+		strings.Contains(normalized, "limit_reached")
 }
 
 func updateAggregatedAvailability(auth *Auth, now time.Time) {

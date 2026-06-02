@@ -133,6 +133,8 @@ type CredentialTokenUsage struct {
 	TotalTokens     int64  `json:"total_tokens"`
 	LastUsedAt      string `json:"last_used_at,omitempty"`
 	LastUsedAtMS    int64  `json:"last_used_at_ms,omitempty"`
+	CycleStartAt    string `json:"cycle_start_at,omitempty"`
+	CycleStartAtMS  int64  `json:"cycle_start_at_ms,omitempty"`
 }
 
 type ModelAggregate struct {
@@ -422,6 +424,8 @@ func runCooldownCommands() {
 			err = store.DeleteCooldown(ctx, command.authID, command.model)
 		case "delete-auth":
 			err = store.DeleteAuthCooldowns(ctx, command.authID)
+		case "delete-auth-quota":
+			err = store.DeleteAuthQuotaCooldowns(ctx, command.authID)
 		}
 		if err != nil {
 			log.WithError(err).Warn("failed to update persisted auth cooldown")
@@ -458,6 +462,21 @@ func ClearAuthCooldownsAsync(authID string) {
 		action: "delete-auth",
 		authID: strings.TrimSpace(authID),
 	})
+}
+
+func ClearAuthQuotaCooldownsAsync(authID string) {
+	enqueueCooldownCommand(cooldownCommand{
+		action: "delete-auth-quota",
+		authID: strings.TrimSpace(authID),
+	})
+}
+
+func ClearAuthQuotaCooldowns(ctx context.Context, authID string) error {
+	store := DefaultStore()
+	if store == nil {
+		return nil
+	}
+	return store.DeleteAuthQuotaCooldowns(ctx, authID)
 }
 
 func enqueueCooldownCommand(command cooldownCommand) {
@@ -788,6 +807,19 @@ func (s *Store) DeleteAuthCooldowns(ctx context.Context, authID string) error {
 	return err
 }
 
+func (s *Store) DeleteAuthQuotaCooldowns(ctx context.Context, authID string) error {
+	if s == nil || s.db == nil {
+		return errors.New("usage store is closed")
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `delete from auth_cooldowns
+		where auth_id = ? and (quota_exceeded != 0 or http_status = ?)`, authID, http.StatusTooManyRequests)
+	return err
+}
+
 func (s *Store) ActiveCooldownsByAuth(ctx context.Context, authID string, now time.Time) ([]CooldownState, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("usage store is closed")
@@ -866,6 +898,14 @@ func CredentialTokenUsages(ctx context.Context) ([]CredentialTokenUsage, error) 
 	return store.CredentialTokenUsages(ctx)
 }
 
+func CredentialTokenUsagesForQuotaSnapshots(ctx context.Context, snapshots []QuotaSnapshot) ([]CredentialTokenUsage, error) {
+	store := DefaultStore()
+	if store == nil {
+		return nil, nil
+	}
+	return store.CredentialTokenUsagesForQuotaSnapshots(ctx, snapshots)
+}
+
 func (s *Store) UpsertQuotaSnapshot(ctx context.Context, snapshot QuotaSnapshot) (QuotaSnapshot, error) {
 	if s == nil || s.db == nil {
 		return QuotaSnapshot{}, errors.New("usage store is closed")
@@ -941,25 +981,74 @@ func (s *Store) QuotaSnapshots(ctx context.Context) ([]QuotaSnapshot, error) {
 }
 
 func (s *Store) CredentialTokenUsages(ctx context.Context) ([]CredentialTokenUsage, error) {
+	return s.credentialTokenUsages(ctx, nil)
+}
+
+func (s *Store) CredentialTokenUsagesForQuotaSnapshots(ctx context.Context, snapshots []QuotaSnapshot) ([]CredentialTokenUsage, error) {
+	cycleStartByAuthIndex := quotaCycleStartsByAuthIndex(snapshots, time.Now().UTC())
+	return s.credentialTokenUsages(ctx, cycleStartByAuthIndex)
+}
+
+func (s *Store) credentialTokenUsages(ctx context.Context, cycleStartByAuthIndex map[string]int64) ([]CredentialTokenUsage, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("usage store is closed")
 	}
-	rows, err := s.db.QueryContext(ctx, `select
-		auth_index,
+
+	query := `select
+		e.auth_index,
 		count(*),
-		sum(case when failed = 0 then 1 else 0 end),
-		sum(case when failed != 0 then 1 else 0 end),
-		coalesce(sum(input_tokens), 0),
-		coalesce(sum(output_tokens), 0),
-		coalesce(sum(reasoning_tokens), 0),
-		coalesce(sum(cached_tokens), 0),
-		coalesce(sum(cache_tokens), 0),
-		coalesce(sum(total_tokens), 0),
-		coalesce(max(timestamp_ms), 0)
-		from usage_events
-		where trim(coalesce(auth_index, '')) != ''
-		group by auth_index
-		order by auth_index`)
+		sum(case when e.failed = 0 then 1 else 0 end),
+		sum(case when e.failed != 0 then 1 else 0 end),
+		coalesce(sum(e.input_tokens), 0),
+		coalesce(sum(e.output_tokens), 0),
+		coalesce(sum(e.reasoning_tokens), 0),
+		coalesce(sum(e.cached_tokens), 0),
+		coalesce(sum(e.cache_tokens), 0),
+		coalesce(sum(e.total_tokens), 0),
+		coalesce(max(e.timestamp_ms), 0),
+		0
+		from usage_events e
+		where trim(coalesce(e.auth_index, '')) != ''
+		group by e.auth_index
+		order by e.auth_index`
+	args := []any(nil)
+
+	if len(cycleStartByAuthIndex) > 0 {
+		values := make([]string, 0, len(cycleStartByAuthIndex))
+		args = make([]any, 0, len(cycleStartByAuthIndex)*2)
+		for authIndex, cycleStartMS := range cycleStartByAuthIndex {
+			authIndex = strings.TrimSpace(authIndex)
+			if authIndex == "" || cycleStartMS <= 0 {
+				continue
+			}
+			values = append(values, "(?, ?)")
+			args = append(args, authIndex, cycleStartMS)
+		}
+		if len(values) > 0 {
+			query = `with cycle(auth_index, cycle_start_ms) as (values ` + strings.Join(values, ",") + `)
+				select
+				e.auth_index,
+				count(*),
+				sum(case when e.failed = 0 then 1 else 0 end),
+				sum(case when e.failed != 0 then 1 else 0 end),
+				coalesce(sum(e.input_tokens), 0),
+				coalesce(sum(e.output_tokens), 0),
+				coalesce(sum(e.reasoning_tokens), 0),
+				coalesce(sum(e.cached_tokens), 0),
+				coalesce(sum(e.cache_tokens), 0),
+				coalesce(sum(e.total_tokens), 0),
+				coalesce(max(e.timestamp_ms), 0),
+				coalesce(max(c.cycle_start_ms), 0)
+				from usage_events e
+				left join cycle c on e.auth_index = c.auth_index
+				where trim(coalesce(e.auth_index, '')) != ''
+					and (coalesce(c.cycle_start_ms, 0) = 0 or e.timestamp_ms >= c.cycle_start_ms)
+				group by e.auth_index
+				order by e.auth_index`
+		}
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -969,6 +1058,7 @@ func (s *Store) CredentialTokenUsages(ctx context.Context) ([]CredentialTokenUsa
 	for rows.Next() {
 		var usage CredentialTokenUsage
 		var lastUsedAtMS int64
+		var cycleStartAtMS int64
 		if err := rows.Scan(
 			&usage.AuthIndex,
 			&usage.RequestCount,
@@ -981,6 +1071,7 @@ func (s *Store) CredentialTokenUsages(ctx context.Context) ([]CredentialTokenUsa
 			&usage.CacheTokens,
 			&usage.TotalTokens,
 			&lastUsedAtMS,
+			&cycleStartAtMS,
 		); err != nil {
 			return nil, err
 		}
@@ -989,9 +1080,212 @@ func (s *Store) CredentialTokenUsages(ctx context.Context) ([]CredentialTokenUsa
 			usage.LastUsedAtMS = lastUsedAtMS
 			usage.LastUsedAt = time.UnixMilli(lastUsedAtMS).UTC().Format(time.RFC3339)
 		}
+		if cycleStartAtMS > 0 {
+			usage.CycleStartAtMS = cycleStartAtMS
+			usage.CycleStartAt = time.UnixMilli(cycleStartAtMS).UTC().Format(time.RFC3339)
+		}
 		out = append(out, usage)
 	}
 	return out, rows.Err()
+}
+
+func quotaCycleStartsByAuthIndex(snapshots []QuotaSnapshot, now time.Time) map[string]int64 {
+	if len(snapshots) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	out := make(map[string]int64)
+	for _, snapshot := range snapshots {
+		snapshot = normalizeQuotaSnapshot(snapshot)
+		authIndex := strings.TrimSpace(snapshot.AuthIndex)
+		if authIndex == "" {
+			continue
+		}
+		cycleStart := quotaCycleStartMS(snapshot, now)
+		if cycleStart <= 0 {
+			continue
+		}
+		if existing := out[authIndex]; existing == 0 || cycleStart > existing {
+			out[authIndex] = cycleStart
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func quotaCycleStartMS(snapshot QuotaSnapshot, now time.Time) int64 {
+	if snapshot.QuotaJSON == "" {
+		return 0
+	}
+	var root any
+	if err := json.Unmarshal([]byte(snapshot.QuotaJSON), &root); err != nil {
+		return 0
+	}
+	candidates := make([]int64, 0, 2)
+	collectQuotaCycleStarts(root, snapshot.RefreshedAt, now, &candidates)
+	if len(candidates) == 0 {
+		return 0
+	}
+	best := int64(0)
+	for _, candidate := range candidates {
+		if candidate > best {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func collectQuotaCycleStarts(value any, observedAt, now time.Time, out *[]int64) {
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			collectQuotaCycleStarts(item, observedAt, now, out)
+		}
+	case map[string]any:
+		if startMS := explicitQuotaCycleStartMS(typed); startMS > 0 {
+			*out = append(*out, startMS)
+		}
+		if resetMS := quotaResetMS(typed, observedAt); resetMS > 0 {
+			if durationMS := quotaWindowDurationMS(typed); durationMS > 0 {
+				nextReset := rollQuotaResetForward(resetMS, durationMS, now)
+				if nextReset > durationMS {
+					*out = append(*out, nextReset-durationMS)
+				}
+			}
+		}
+		for _, child := range typed {
+			collectQuotaCycleStarts(child, observedAt, now, out)
+		}
+	}
+}
+
+func explicitQuotaCycleStartMS(record map[string]any) int64 {
+	for _, key := range []string{
+		"cycleStartAt", "cycle_start_at",
+		"periodStart", "period_start",
+		"billingPeriodStart", "billing_period_start",
+		"startAt", "start_at",
+	} {
+		if ms := quotaTimeValueMS(record[key]); ms > 0 {
+			return ms
+		}
+	}
+	return 0
+}
+
+func quotaResetMS(record map[string]any, observedAt time.Time) int64 {
+	for _, key := range []string{"resetAt", "reset_at", "resetTime", "reset_time", "resets_at"} {
+		if ms := quotaTimeValueMS(record[key]); ms > 0 {
+			return ms
+		}
+	}
+	for _, key := range []string{"resetAfterSeconds", "reset_after_seconds", "resetIn", "reset_in", "ttl"} {
+		seconds, ok := quotaNumberValue(record[key])
+		if !ok || seconds <= 0 {
+			continue
+		}
+		base := observedAt
+		if base.IsZero() {
+			base = time.Now().UTC()
+		}
+		return base.UnixMilli() + int64(seconds*1000)
+	}
+	return 0
+}
+
+func quotaWindowDurationMS(record map[string]any) int64 {
+	for _, key := range []string{"windowMinutes", "window_minutes"} {
+		if minutes, ok := quotaNumberValue(record[key]); ok && minutes > 0 {
+			return int64(minutes * 60 * 1000)
+		}
+	}
+	for _, key := range []string{
+		"windowSeconds", "window_seconds",
+		"limitWindowSeconds", "limit_window_seconds",
+		"durationSeconds", "duration_seconds",
+	} {
+		if seconds, ok := quotaNumberValue(record[key]); ok && seconds > 0 {
+			return int64(seconds * 1000)
+		}
+	}
+	return 0
+}
+
+func quotaTimeValueMS(value any) int64 {
+	switch typed := value.(type) {
+	case float64:
+		if typed <= 0 {
+			return 0
+		}
+		if typed > 1_000_000_000_000 {
+			return int64(typed)
+		}
+		return int64(typed * 1000)
+	case int:
+		return quotaTimeValueMS(int64(typed))
+	case int64:
+		if typed <= 0 {
+			return 0
+		}
+		if typed > 1_000_000_000_000 {
+			return typed
+		}
+		return typed * 1000
+	case json.Number:
+		number, err := typed.Float64()
+		if err != nil {
+			return 0
+		}
+		return quotaTimeValueMS(number)
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" || trimmed == "-" {
+			return 0
+		}
+		if numeric, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return quotaTimeValueMS(numeric)
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+			return parsed.UTC().UnixMilli()
+		}
+		if parsed, err := time.Parse(time.RFC3339, trimmed); err == nil {
+			return parsed.UTC().UnixMilli()
+		}
+	}
+	return 0
+}
+
+func quotaNumberValue(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func rollQuotaResetForward(resetMS, durationMS int64, now time.Time) int64 {
+	if resetMS <= 0 || durationMS <= 0 {
+		return 0
+	}
+	nowMS := now.UnixMilli()
+	if resetMS > nowMS {
+		return resetMS
+	}
+	behind := nowMS - resetMS
+	steps := behind/durationMS + 1
+	return resetMS + steps*durationMS
 }
 
 func normalizeQuotaSnapshot(snapshot QuotaSnapshot) QuotaSnapshot {

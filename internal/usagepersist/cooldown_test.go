@@ -2,6 +2,7 @@ package usagepersist
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -57,6 +58,55 @@ func TestStoreCooldownLifecycle(t *testing.T) {
 	}
 	if len(active) != 0 {
 		t.Fatalf("active cooldowns after delete len = %d, want 0", len(active))
+	}
+}
+
+func TestStoreDeleteAuthQuotaCooldownsOnlyRemovesQuotaRows(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "usage.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if errClose := store.Close(); errClose != nil {
+			t.Fatalf("close store: %v", errClose)
+		}
+	}()
+
+	nextRetry := time.Now().Add(time.Hour).UTC()
+	states := []CooldownState{
+		{
+			AuthID:         "auth-1",
+			Provider:       "codex",
+			Model:          "gpt-5-quota",
+			HTTPStatus:     http.StatusTooManyRequests,
+			NextRetryAfter: nextRetry,
+			QuotaExceeded:  true,
+		},
+		{
+			AuthID:         "auth-1",
+			Provider:       "codex",
+			Model:          "gpt-5-transient",
+			HTTPStatus:     http.StatusBadGateway,
+			NextRetryAfter: nextRetry,
+		},
+	}
+	for _, state := range states {
+		if err := store.UpsertCooldown(ctx, state); err != nil {
+			t.Fatalf("upsert cooldown %s: %v", state.Model, err)
+		}
+	}
+
+	if err := store.DeleteAuthQuotaCooldowns(ctx, "auth-1"); err != nil {
+		t.Fatalf("delete auth quota cooldowns: %v", err)
+	}
+
+	active, err := store.ActiveCooldownsByAuth(ctx, "auth-1", time.Now())
+	if err != nil {
+		t.Fatalf("active cooldowns: %v", err)
+	}
+	if len(active) != 1 || active[0].Model != "gpt-5-transient" {
+		t.Fatalf("active cooldowns = %+v, want only non-quota transient row", active)
 	}
 }
 

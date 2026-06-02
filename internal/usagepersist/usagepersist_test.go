@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -416,6 +417,73 @@ func TestStoreCredentialTokenUsagesAggregatesByAuthIndex(t *testing.T) {
 	}
 	if got.LastUsedAt == "" || got.LastUsedAtMS == 0 {
 		t.Fatalf("last used fields missing: %+v", got)
+	}
+}
+
+func TestStoreCredentialTokenUsagesForQuotaSnapshotsUsesCurrentCycle(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	cycleStart := now.Add(-3 * time.Hour)
+	resetAt := cycleStart.Add(5 * time.Hour)
+
+	_, err := store.InsertEvents(ctx, []Event{
+		{
+			RequestID:   "req-before-cycle",
+			Timestamp:   cycleStart.Add(-time.Minute).Format(time.RFC3339),
+			TimestampMS: cycleStart.Add(-time.Minute).UnixMilli(),
+			Model:       "gpt-5",
+			AuthIndex:   "idx-cycle",
+			TotalTokens: 111,
+		},
+		{
+			RequestID:   "req-after-cycle",
+			Timestamp:   cycleStart.Add(time.Minute).Format(time.RFC3339),
+			TimestampMS: cycleStart.Add(time.Minute).UnixMilli(),
+			Model:       "gpt-5",
+			AuthIndex:   "idx-cycle",
+			TotalTokens: 22,
+		},
+		{
+			RequestID:   "req-no-snapshot",
+			Timestamp:   cycleStart.Add(-time.Hour).Format(time.RFC3339),
+			TimestampMS: cycleStart.Add(-time.Hour).UnixMilli(),
+			Model:       "gpt-5",
+			AuthIndex:   "idx-no-snapshot",
+			TotalTokens: 7,
+		},
+	})
+	if err != nil {
+		t.Fatalf("insert events: %v", err)
+	}
+
+	usages, err := store.CredentialTokenUsagesForQuotaSnapshots(ctx, []QuotaSnapshot{
+		{
+			Provider:    "codex",
+			AuthIndex:   "idx-cycle",
+			RefreshedAt: now,
+			QuotaJSON:   `{"status":"success","windows":[{"id":"five-hour","usedPercent":25,"resetAt":` + strconv.FormatInt(resetAt.Unix(), 10) + `,"windowMinutes":300}]}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("credential token usages for quota snapshots: %v", err)
+	}
+
+	usageByIndex := make(map[string]CredentialTokenUsage, len(usages))
+	for _, usage := range usages {
+		usageByIndex[usage.AuthIndex] = usage
+	}
+	cycled := usageByIndex["idx-cycle"]
+	if cycled.RequestCount != 1 || cycled.TotalTokens != 22 {
+		t.Fatalf("cycled usage = %+v, want only events after cycle start", cycled)
+	}
+	if cycled.CycleStartAtMS != cycleStart.UnixMilli() || cycled.CycleStartAt == "" {
+		t.Fatalf("cycle start fields = %+v, want %d", cycled, cycleStart.UnixMilli())
+	}
+
+	full := usageByIndex["idx-no-snapshot"]
+	if full.RequestCount != 1 || full.TotalTokens != 7 || full.CycleStartAtMS != 0 {
+		t.Fatalf("usage without snapshot = %+v, want lifetime aggregation without cycle start", full)
 	}
 }
 
