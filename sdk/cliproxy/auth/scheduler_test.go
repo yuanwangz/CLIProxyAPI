@@ -670,7 +670,7 @@ func TestSchedulerPick_QuotaHintOnlyReordersWithinPriorityBucket(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_FillFirstReordersWhenQuotaHintArrivesAfterShardBuild(t *testing.T) {
+func TestSchedulerPick_FillFirstUsesQuotaHintArrivingBeforeFirstPick(t *testing.T) {
 	t.Cleanup(func() {
 		ClearQuotaRoutingHintForTest("alpha-far")
 		ClearQuotaRoutingHintForTest("zulu-near")
@@ -682,24 +682,101 @@ func TestSchedulerPick_FillFirstReordersWhenQuotaHintArrivesAfterShardBuild(t *t
 		&Auth{ID: "zulu-near", Provider: "codex"},
 	)
 
-	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
-	if err != nil {
-		t.Fatalf("initial pickSingle error = %v", err)
+	scheduler.mu.Lock()
+	providerState := scheduler.providers["codex"]
+	if providerState == nil {
+		scheduler.mu.Unlock()
+		t.Fatal("scheduler missing codex provider")
 	}
-	if got == nil || got.ID != "alpha-far" {
-		t.Fatalf("initial FillFirst auth.ID = %v, want alpha-far", got)
-	}
+	providerState.ensureModelLocked("", time.Now())
+	scheduler.mu.Unlock()
 
 	now := time.Now()
 	SetQuotaRoutingHint("alpha-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour), Window: 5 * time.Hour})
 	SetQuotaRoutingHint("zulu-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute), Window: 5 * time.Hour})
 
-	got, err = scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
 	if err != nil {
 		t.Fatalf("pickSingle after hint update error = %v", err)
 	}
 	if got == nil || got.ID != "zulu-near" {
 		t.Fatalf("FillFirst after hint update auth.ID = %v, want zulu-near", got)
+	}
+}
+
+func TestSchedulerPick_FillFirstKeepsStickyAuthUntilUnavailable(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("sticky-near")
+		ClearQuotaRoutingHintForTest("sticky-mid")
+		ClearQuotaRoutingHintForTest("sticky-far")
+	})
+
+	now := time.Now()
+	SetQuotaRoutingHint("sticky-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour), Window: 5 * time.Hour})
+	SetQuotaRoutingHint("sticky-mid", QuotaRoutingHint{ResetAt: now.Add(2 * time.Hour), Window: 5 * time.Hour})
+	SetQuotaRoutingHint("sticky-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute), Window: 5 * time.Hour})
+
+	near := &Auth{ID: "sticky-near", Provider: "codex"}
+	mid := &Auth{ID: "sticky-mid", Provider: "codex"}
+	far := &Auth{ID: "sticky-far", Provider: "codex"}
+	scheduler := newSchedulerForTest(&FillFirstSelector{}, far, mid, near)
+
+	for index := 0; index < 3; index++ {
+		got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if err != nil {
+			t.Fatalf("initial sticky pick #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != "sticky-near" {
+			t.Fatalf("initial sticky pick #%d auth.ID = %v, want sticky-near", index, got)
+		}
+	}
+
+	SetQuotaRoutingHint("sticky-mid", QuotaRoutingHint{ResetAt: now.Add(5 * time.Minute), Window: 5 * time.Hour})
+	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle after competing hint error = %v", err)
+	}
+	if got == nil || got.ID != "sticky-near" {
+		t.Fatalf("FillFirst changed after competing hint: got %v, want sticky-near", got)
+	}
+
+	near.Unavailable = true
+	near.NextRetryAfter = now.Add(time.Hour)
+	near.Quota = QuotaState{Exceeded: true}
+	scheduler.upsertAuth(near)
+	for index := 0; index < 2; index++ {
+		got, err = scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if err != nil {
+			t.Fatalf("fallback sticky pick #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != "sticky-mid" {
+			t.Fatalf("fallback sticky pick #%d auth.ID = %v, want sticky-mid", index, got)
+		}
+	}
+
+	near.Unavailable = false
+	near.NextRetryAfter = time.Time{}
+	near.Quota = QuotaState{}
+	scheduler.upsertAuth(near)
+	SetQuotaRoutingHint("sticky-near", QuotaRoutingHint{ResetAt: now.Add(time.Minute), Window: 5 * time.Hour})
+	got, err = scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle after original auth recovery error = %v", err)
+	}
+	if got == nil || got.ID != "sticky-mid" {
+		t.Fatalf("FillFirst changed after original auth recovered: got %v, want sticky-mid", got)
+	}
+
+	mid.Unavailable = true
+	mid.NextRetryAfter = now.Add(time.Hour)
+	mid.Quota = QuotaState{Exceeded: true}
+	scheduler.upsertAuth(mid)
+	got, err = scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle after second sticky unavailable error = %v", err)
+	}
+	if got == nil || got.ID != "sticky-near" {
+		t.Fatalf("FillFirst next auth after sticky unavailable = %v, want sticky-near", got)
 	}
 }
 
@@ -821,6 +898,7 @@ func TestSchedulerPick_MixedFillFirstFallbackStaysOnNearestQuotaReset(t *testing
 		t.Fatalf("recovered pickMixed = (%v, %q), want third-party/openai-compat", got, provider)
 	}
 
+	SetQuotaRoutingHint("codex-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Minute), Window: 5 * time.Hour})
 	thirdParty.Unavailable = true
 	thirdParty.NextRetryAfter = now.Add(2 * time.Minute)
 	scheduler.upsertAuth(thirdParty)

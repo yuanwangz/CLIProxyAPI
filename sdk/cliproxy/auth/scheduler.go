@@ -63,6 +63,7 @@ type modelScheduler struct {
 	priorityOrder        []int
 	readyByPriority      map[int]*readyBucket
 	blocked              cooldownQueue
+	fillFirstSticky      map[fillFirstStickyKey]string
 	quotaRoutingRevision uint64
 	quotaRoutingSnapshot map[string]quotaRoutingSnapshotValue
 }
@@ -103,6 +104,11 @@ type quotaRoutingSnapshotValue struct {
 	present bool
 	resetAt time.Time
 	window  time.Duration
+}
+
+type fillFirstStickyKey struct {
+	priority  int
+	websocket bool
 }
 
 type readyViewCursorState struct {
@@ -200,8 +206,12 @@ func (s *authScheduler) setSelector(selector Selector) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previousStrategy := s.strategy
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+	if previousStrategy != s.strategy {
+		s.clearFillFirstStickyLocked()
+	}
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -278,7 +288,8 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
+	rememberFillFirst := pinnedAuthID == "" && len(tried) == 0
+	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate, rememberFillFirst); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -331,13 +342,14 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, s.strategy, predicate, false); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
 	predicate := triedPredicate(tried)
+	rememberFillFirst := len(tried) == 0
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
@@ -371,7 +383,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate, rememberFillFirst)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -425,7 +437,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate, false)
 		if picked == nil {
 			continue
 		}
@@ -561,6 +573,23 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 		s.providers[providerKey] = providerState
 	}
 	return providerState
+}
+
+func (s *authScheduler) clearFillFirstStickyLocked() {
+	if s == nil {
+		return
+	}
+	for _, providerState := range s.providers {
+		if providerState == nil {
+			continue
+		}
+		for _, shard := range providerState.modelShards {
+			if shard == nil {
+				continue
+			}
+			clear(shard.fillFirstSticky)
+		}
+	}
 }
 
 // buildScheduledAuthMeta extracts the scheduling metadata needed for shard bookkeeping.
@@ -765,7 +794,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, rememberFillFirst bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -775,7 +804,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate, rememberFillFirst)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -811,7 +840,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, rememberFillFirst bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -821,12 +850,14 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	view := &bucket.all
+	websocket := false
 	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
 		view = &bucket.ws
+		websocket = true
 	}
 	var picked *scheduledAuth
 	if strategy == schedulerStrategyFillFirst {
-		picked = view.pickFirst(predicate)
+		picked = m.pickFillFirstLocked(view, priority, websocket, predicate, rememberFillFirst)
 	} else {
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -834,6 +865,27 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	return picked.auth
+}
+
+func (m *modelScheduler) pickFillFirstLocked(view *readyView, priority int, websocket bool, predicate func(*scheduledAuth) bool, remember bool) *scheduledAuth {
+	if m == nil || view == nil {
+		return nil
+	}
+	key := fillFirstStickyKey{priority: priority, websocket: websocket}
+	if authID := m.fillFirstSticky[key]; authID != "" {
+		if picked := view.pickByAuthID(authID, predicate); picked != nil {
+			return picked
+		}
+	}
+	picked := view.pickFirst(predicate)
+	if picked == nil || picked.auth == nil || !remember {
+		return picked
+	}
+	if m.fillFirstSticky == nil {
+		m.fillFirstSticky = make(map[fillFirstStickyKey]string)
+	}
+	m.fillFirstSticky[key] = picked.auth.ID
+	return picked
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
@@ -1112,6 +1164,23 @@ func (v *readyView) pickFirst(predicate func(*scheduledAuth) bool) *scheduledAut
 		if predicate == nil || predicate(entry) {
 			return entry
 		}
+	}
+	return nil
+}
+
+func (v *readyView) pickByAuthID(authID string, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil
+	}
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil || entry.auth.ID != authID {
+			continue
+		}
+		if predicate == nil || predicate(entry) {
+			return entry
+		}
+		return nil
 	}
 	return nil
 }

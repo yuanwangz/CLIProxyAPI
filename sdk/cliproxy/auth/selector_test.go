@@ -120,6 +120,60 @@ func TestRoundRobinSelectorPick_StartsFromNearestQuotaReset(t *testing.T) {
 	}
 }
 
+func TestFillFirstSelectorPick_KeepsStickyQuotaResetCandidate(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("selector-fill-near")
+		ClearQuotaRoutingHintForTest("selector-fill-mid")
+		ClearQuotaRoutingHintForTest("selector-fill-far")
+	})
+
+	now := time.Now()
+	SetQuotaRoutingHint("selector-fill-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour)})
+	SetQuotaRoutingHint("selector-fill-mid", QuotaRoutingHint{ResetAt: now.Add(2 * time.Hour)})
+	SetQuotaRoutingHint("selector-fill-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute)})
+
+	selector := &FillFirstSelector{}
+	near := &Auth{ID: "selector-fill-near", Provider: "codex"}
+	mid := &Auth{ID: "selector-fill-mid", Provider: "codex"}
+	far := &Auth{ID: "selector-fill-far", Provider: "codex"}
+	auths := []*Auth{far, mid, near}
+
+	for index := 0; index < 3; index++ {
+		got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != "selector-fill-near" {
+			t.Fatalf("Pick() #%d auth.ID = %v, want selector-fill-near", index, got)
+		}
+	}
+
+	SetQuotaRoutingHint("selector-fill-mid", QuotaRoutingHint{ResetAt: now.Add(5 * time.Minute)})
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() after competing hint error = %v", err)
+	}
+	if got == nil || got.ID != "selector-fill-near" {
+		t.Fatalf("Pick() after competing hint auth.ID = %v, want selector-fill-near", got)
+	}
+
+	near.ModelStates = map[string]*ModelState{
+		"test-model": {
+			Status:         StatusActive,
+			Unavailable:    true,
+			NextRetryAfter: now.Add(time.Hour),
+			Quota:          QuotaState{Exceeded: true},
+		},
+	}
+	got, err = selector.Pick(context.Background(), "codex", "test-model", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() after sticky cooldown error = %v", err)
+	}
+	if got == nil || got.ID != "selector-fill-mid" {
+		t.Fatalf("Pick() after sticky cooldown auth.ID = %v, want selector-fill-mid", got)
+	}
+}
+
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 

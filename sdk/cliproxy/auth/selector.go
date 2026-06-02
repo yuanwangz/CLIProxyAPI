@@ -33,7 +33,11 @@ type RoundRobinSelector struct {
 // FillFirstSelector selects the first available credential (deterministic ordering).
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
-type FillFirstSelector struct{}
+type FillFirstSelector struct {
+	mu      sync.Mutex
+	sticky  map[string]string
+	maxKeys int
+}
 
 type blockReason int
 
@@ -391,7 +395,44 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	return available[0], nil
+	return s.pickSticky(provider, model, available), nil
+}
+
+func (s *FillFirstSelector) pickSticky(provider, model string, available []*Auth) *Auth {
+	if len(available) == 0 {
+		return nil
+	}
+	priority := authPriority(available[0])
+	key := fillFirstSelectorStickyKey(provider, model, priority)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sticky == nil {
+		s.sticky = make(map[string]string)
+	}
+	if authID := s.sticky[key]; authID != "" {
+		for _, candidate := range available {
+			if candidate != nil && candidate.ID == authID {
+				return candidate
+			}
+		}
+	}
+	limit := s.maxKeys
+	if limit <= 0 {
+		limit = 4096
+	}
+	if _, ok := s.sticky[key]; !ok && len(s.sticky) >= limit {
+		s.sticky = make(map[string]string)
+	}
+	selected := available[0]
+	if selected != nil {
+		s.sticky[key] = selected.ID
+	}
+	return selected
+}
+
+func fillFirstSelectorStickyKey(provider, model string, priority int) string {
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	return providerKey + ":" + canonicalModelKey(model) + ":" + strconv.Itoa(priority)
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
