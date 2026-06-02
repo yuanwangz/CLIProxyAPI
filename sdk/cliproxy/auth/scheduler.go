@@ -58,11 +58,13 @@ type scheduledAuthMeta struct {
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
 type modelScheduler struct {
-	modelKey        string
-	entries         map[string]*scheduledAuth
-	priorityOrder   []int
-	readyByPriority map[int]*readyBucket
-	blocked         cooldownQueue
+	modelKey             string
+	entries              map[string]*scheduledAuth
+	priorityOrder        []int
+	readyByPriority      map[int]*readyBucket
+	blocked              cooldownQueue
+	quotaRoutingRevision uint64
+	quotaRoutingSnapshot map[string]quotaRoutingSnapshotValue
 }
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
@@ -96,6 +98,12 @@ type childBucket struct {
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
 type cooldownQueue []*scheduledAuth
+
+type quotaRoutingSnapshotValue struct {
+	present bool
+	resetAt time.Time
+	window  time.Duration
+}
 
 type readyViewCursorState struct {
 	cursor       int
@@ -762,6 +770,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 		return nil
 	}
 	m.promoteExpiredLocked(time.Now())
+	m.refreshQuotaRoutingHintsLocked()
 	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
 	if !okPriority {
 		return nil
@@ -806,6 +815,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if m == nil {
 		return nil
 	}
+	m.refreshQuotaRoutingHintsLocked()
 	bucket := m.readyByPriority[priority]
 	if bucket == nil {
 		return nil
@@ -890,14 +900,21 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.
 func (m *modelScheduler) rebuildIndexesLocked() {
-	cursorStates := make(map[int]readyBucketCursorState, len(m.readyByPriority))
-	for priority, bucket := range m.readyByPriority {
-		if bucket == nil {
-			continue
-		}
-		cursorStates[priority] = readyBucketCursorState{
-			all: snapshotReadyViewCursors(bucket.all),
-			ws:  snapshotReadyViewCursors(bucket.ws),
+	m.rebuildIndexesLockedWithCursorRestore(true)
+}
+
+func (m *modelScheduler) rebuildIndexesLockedWithCursorRestore(restoreCursors bool) {
+	var cursorStates map[int]readyBucketCursorState
+	if restoreCursors {
+		cursorStates = make(map[int]readyBucketCursorState, len(m.readyByPriority))
+		for priority, bucket := range m.readyByPriority {
+			if bucket == nil {
+				continue
+			}
+			cursorStates[priority] = readyBucketCursorState{
+				all: snapshotReadyViewCursors(bucket.all),
+				ws:  snapshotReadyViewCursors(bucket.ws),
+			}
 		}
 	}
 
@@ -949,6 +966,72 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		}
 		return left.nextRetryAt.Before(right.nextRetryAt)
 	})
+	m.quotaRoutingRevision = quotaRoutingHintsRevision()
+	m.quotaRoutingSnapshot = m.quotaRoutingSnapshotLocked()
+}
+
+func (m *modelScheduler) refreshQuotaRoutingHintsLocked() {
+	if m == nil {
+		return
+	}
+	if m.quotaRoutingRevision == quotaRoutingHintsRevision() {
+		return
+	}
+	if !m.quotaRoutingSnapshotChangedLocked() {
+		m.quotaRoutingRevision = quotaRoutingHintsRevision()
+		return
+	}
+	m.rebuildIndexesLockedWithCursorRestore(false)
+}
+
+func (m *modelScheduler) quotaRoutingSnapshotChangedLocked() bool {
+	current := m.quotaRoutingSnapshotLocked()
+	if len(current) != len(m.quotaRoutingSnapshot) {
+		return true
+	}
+	for authID, currentValue := range current {
+		previousValue, ok := m.quotaRoutingSnapshot[authID]
+		if !ok || !sameQuotaRoutingSnapshotValue(previousValue, currentValue) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *modelScheduler) quotaRoutingSnapshotLocked() map[string]quotaRoutingSnapshotValue {
+	if m == nil || len(m.entries) == 0 {
+		return nil
+	}
+	snapshot := make(map[string]quotaRoutingSnapshotValue, len(m.entries))
+	for authID, entry := range m.entries {
+		if entry == nil || entry.auth == nil || entry.state != scheduledStateReady {
+			continue
+		}
+		snapshot[authID] = quotaRoutingSnapshotForAuth(entry.auth)
+	}
+	if len(snapshot) == 0 {
+		return nil
+	}
+	return snapshot
+}
+
+func quotaRoutingSnapshotForAuth(auth *Auth) quotaRoutingSnapshotValue {
+	if auth == nil {
+		return quotaRoutingSnapshotValue{}
+	}
+	hint, ok := GetQuotaRoutingHint(auth.ID)
+	if !ok {
+		return quotaRoutingSnapshotValue{}
+	}
+	return quotaRoutingSnapshotValue{
+		present: true,
+		resetAt: hint.ResetAt,
+		window:  hint.Window,
+	}
+}
+
+func sameQuotaRoutingSnapshotValue(left, right quotaRoutingSnapshotValue) bool {
+	return left.present == right.present && left.resetAt.Equal(right.resetAt) && left.window == right.window
 }
 
 // buildReadyBucket prepares the general and websocket-only ready views for one priority bucket.

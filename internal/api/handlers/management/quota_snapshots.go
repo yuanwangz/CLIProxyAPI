@@ -81,13 +81,18 @@ func (h *Handler) PutQuotaSnapshot(c *gin.Context) {
 		return
 	}
 
-	snapshot, errUpsert := usagepersist.UpsertQuotaSnapshot(c.Request.Context(), usagepersist.QuotaSnapshot{
+	snapshotInput := usagepersist.QuotaSnapshot{
 		Provider:  body.Provider,
 		AuthID:    firstNonEmptyValue(body.AuthID, body.AuthIDCamel),
 		AuthIndex: firstNonEmptyValue(body.AuthIndex, body.AuthIndexCamel),
 		FileName:  firstNonEmptyValue(body.FileName, body.FileNameCamel),
 		QuotaJSON: quota,
-	})
+	}
+	if strings.TrimSpace(snapshotInput.AuthID) == "" {
+		snapshotInput.AuthID = h.authIDByQuotaSnapshot(snapshotInput)
+	}
+
+	snapshot, errUpsert := usagepersist.UpsertQuotaSnapshot(c.Request.Context(), snapshotInput)
 	if errUpsert != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errUpsert.Error()})
 		return

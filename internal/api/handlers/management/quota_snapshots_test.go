@@ -244,6 +244,64 @@ func TestPutQuotaSnapshotDoesNotClearExhaustedQuotaCooldown(t *testing.T) {
 	}
 }
 
+func TestPutQuotaSnapshotResolvesAuthIDFromAuthIndexForRoutingHint(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	if err := usagepersist.Init(filepath.Join(t.TempDir(), "usage.sqlite"), false); err != nil {
+		t.Fatalf("init usage persistence: %v", err)
+	}
+
+	ctx := context.Background()
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	authRecord := &coreauth.Auth{
+		ID:       "quota-auth-index-only",
+		Provider: "codex",
+		FileName: "quota-auth-index-only.json",
+	}
+	authRecord.EnsureIndex()
+	t.Cleanup(func() { coreauth.ClearQuotaRoutingHintForTest(authRecord.ID) })
+	if _, err := manager.Register(ctx, authRecord); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	resetAt := time.Now().Add(90 * time.Minute).UTC()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	body := `{"provider":"codex","auth_index":"` + authRecord.Index + `","quota":{"status":"success","windows":[{"id":"five-hour","usedPercent":20,"resetAt":` + strconvFormatUnix(resetAt) + `,"windowMinutes":300}]}}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/quota-snapshots", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ginCtx.Request = req
+	h.PutQuotaSnapshot(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	snapshots, errSnapshots := usagepersist.QuotaSnapshots(ctx)
+	if errSnapshots != nil {
+		t.Fatalf("quota snapshots: %v", errSnapshots)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("quota snapshots = %+v, want one snapshot", snapshots)
+	}
+	if snapshots[0].AuthID != authRecord.ID {
+		t.Fatalf("snapshot AuthID = %q, want %q", snapshots[0].AuthID, authRecord.ID)
+	}
+
+	hint, ok := coreauth.GetQuotaRoutingHint(authRecord.ID)
+	if !ok {
+		t.Fatalf("expected routing hint for %q", authRecord.ID)
+	}
+	if !hint.ResetAt.Equal(time.Unix(resetAt.Unix(), 0).UTC()) {
+		t.Fatalf("routing hint ResetAt = %v, want %v", hint.ResetAt, time.Unix(resetAt.Unix(), 0).UTC())
+	}
+	if hint.Window != 5*time.Hour {
+		t.Fatalf("routing hint Window = %v, want 5h", hint.Window)
+	}
+}
+
 func strconvFormatUnix(value time.Time) string {
 	return strconv.FormatInt(value.Unix(), 10)
 }

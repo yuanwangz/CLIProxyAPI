@@ -3,6 +3,7 @@ package auth
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,7 @@ type QuotaRoutingHint struct {
 }
 
 var quotaRoutingHintByAuth sync.Map
+var quotaRoutingHintRevision atomic.Uint64
 
 // SetQuotaRoutingHint stores the latest known quota reset metadata for an
 // auth. Subsequent calls overwrite the prior value. Empty authID is a no-op.
@@ -40,7 +42,14 @@ func SetQuotaRoutingHint(authID string, hint QuotaRoutingHint) {
 	if hint.UpdatedAt.IsZero() {
 		hint.UpdatedAt = time.Now()
 	}
+	if value, ok := quotaRoutingHintByAuth.Load(authID); ok {
+		if existing, okExisting := value.(QuotaRoutingHint); okExisting && sameQuotaRoutingHintForScheduling(existing, hint) {
+			quotaRoutingHintByAuth.Store(authID, hint)
+			return
+		}
+	}
 	quotaRoutingHintByAuth.Store(authID, hint)
+	quotaRoutingHintRevision.Add(1)
 }
 
 // GetQuotaRoutingHint returns the latest known quota reset metadata for an
@@ -89,6 +98,14 @@ func EffectiveNextReset(hint QuotaRoutingHint, now time.Time) time.Time {
 	return time.Time{}
 }
 
+func sameQuotaRoutingHintForScheduling(left, right QuotaRoutingHint) bool {
+	return left.ResetAt.Equal(right.ResetAt) && left.Window == right.Window
+}
+
+func quotaRoutingHintsRevision() uint64 {
+	return quotaRoutingHintRevision.Load()
+}
+
 // ClearQuotaRoutingHintForTest removes the hint for the given authID. It is
 // only intended for test cleanup across packages; production code should not
 // call this.
@@ -97,5 +114,7 @@ func ClearQuotaRoutingHintForTest(authID string) {
 	if authID == "" {
 		return
 	}
-	quotaRoutingHintByAuth.Delete(authID)
+	if _, ok := quotaRoutingHintByAuth.LoadAndDelete(authID); ok {
+		quotaRoutingHintRevision.Add(1)
+	}
 }

@@ -669,3 +669,166 @@ func TestSchedulerPick_QuotaHintOnlyReordersWithinPriorityBucket(t *testing.T) {
 		t.Fatalf("manual priority must outrank quota hint: got = %v, want high-far", got)
 	}
 }
+
+func TestSchedulerPick_FillFirstReordersWhenQuotaHintArrivesAfterShardBuild(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("alpha-far")
+		ClearQuotaRoutingHintForTest("zulu-near")
+	})
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "alpha-far", Provider: "codex"},
+		&Auth{ID: "zulu-near", Provider: "codex"},
+	)
+
+	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("initial pickSingle error = %v", err)
+	}
+	if got == nil || got.ID != "alpha-far" {
+		t.Fatalf("initial FillFirst auth.ID = %v, want alpha-far", got)
+	}
+
+	now := time.Now()
+	SetQuotaRoutingHint("alpha-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour), Window: 5 * time.Hour})
+	SetQuotaRoutingHint("zulu-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute), Window: 5 * time.Hour})
+
+	got, err = scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle after hint update error = %v", err)
+	}
+	if got == nil || got.ID != "zulu-near" {
+		t.Fatalf("FillFirst after hint update auth.ID = %v, want zulu-near", got)
+	}
+}
+
+func TestSchedulerPick_RoundRobinRestartsWhenQuotaHintArrivesAfterShardBuild(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("rr-alpha-far")
+		ClearQuotaRoutingHintForTest("rr-zulu-near")
+	})
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "rr-alpha-far", Provider: "codex"},
+		&Auth{ID: "rr-zulu-near", Provider: "codex"},
+	)
+
+	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("initial pickSingle error = %v", err)
+	}
+	if got == nil || got.ID != "rr-alpha-far" {
+		t.Fatalf("initial RoundRobin auth.ID = %v, want rr-alpha-far", got)
+	}
+
+	now := time.Now()
+	SetQuotaRoutingHint("rr-alpha-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour), Window: 5 * time.Hour})
+	SetQuotaRoutingHint("rr-zulu-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute), Window: 5 * time.Hour})
+
+	got, err = scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle after hint update error = %v", err)
+	}
+	if got == nil || got.ID != "rr-zulu-near" {
+		t.Fatalf("RoundRobin after hint update auth.ID = %v, want rr-zulu-near", got)
+	}
+}
+
+func TestSchedulerPick_UnrelatedQuotaHintDoesNotResetRoundRobinCursor(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("cursor-a")
+		ClearQuotaRoutingHintForTest("cursor-b")
+		ClearQuotaRoutingHintForTest("unrelated")
+	})
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "cursor-a", Provider: "codex"},
+		&Auth{ID: "cursor-b", Provider: "codex"},
+	)
+
+	got, err := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("initial pickSingle error = %v", err)
+	}
+	if got == nil || got.ID != "cursor-a" {
+		t.Fatalf("initial RoundRobin auth.ID = %v, want cursor-a", got)
+	}
+
+	SetQuotaRoutingHint("unrelated", QuotaRoutingHint{ResetAt: time.Now().Add(30 * time.Minute), Window: time.Hour})
+
+	got, err = scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle after unrelated hint update error = %v", err)
+	}
+	if got == nil || got.ID != "cursor-b" {
+		t.Fatalf("RoundRobin after unrelated hint update auth.ID = %v, want cursor-b", got)
+	}
+}
+
+func TestSchedulerPick_MixedFillFirstFallbackStaysOnNearestQuotaReset(t *testing.T) {
+	t.Cleanup(func() {
+		ClearQuotaRoutingHintForTest("codex-far")
+		ClearQuotaRoutingHintForTest("codex-near")
+	})
+
+	now := time.Now()
+	thirdParty := &Auth{ID: "third-party", Provider: "openai-compat", Attributes: map[string]string{"priority": "10"}}
+	codexFar := &Auth{ID: "codex-far", Provider: "codex"}
+	codexNear := &Auth{ID: "codex-near", Provider: "codex"}
+	SetQuotaRoutingHint("codex-far", QuotaRoutingHint{ResetAt: now.Add(5 * time.Hour), Window: 5 * time.Hour})
+	SetQuotaRoutingHint("codex-near", QuotaRoutingHint{ResetAt: now.Add(30 * time.Minute), Window: 5 * time.Hour})
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		thirdParty,
+		codexFar,
+		codexNear,
+	)
+	providers := []string{"openai-compat", "codex"}
+
+	got, provider, err := scheduler.pickMixed(context.Background(), providers, "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("initial pickMixed error = %v", err)
+	}
+	if got == nil || got.ID != "third-party" || provider != "openai-compat" {
+		t.Fatalf("initial pickMixed = (%v, %q), want third-party/openai-compat", got, provider)
+	}
+
+	thirdParty.Unavailable = true
+	thirdParty.NextRetryAfter = now.Add(time.Minute)
+	scheduler.upsertAuth(thirdParty)
+	for index := 0; index < 3; index++ {
+		got, provider, err = scheduler.pickMixed(context.Background(), providers, "", cliproxyexecutor.Options{}, nil)
+		if err != nil {
+			t.Fatalf("fallback pickMixed #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != "codex-near" || provider != "codex" {
+			t.Fatalf("fallback pickMixed #%d = (%v, %q), want codex-near/codex", index, got, provider)
+		}
+	}
+
+	thirdParty.Unavailable = false
+	thirdParty.NextRetryAfter = time.Time{}
+	scheduler.upsertAuth(thirdParty)
+	got, provider, err = scheduler.pickMixed(context.Background(), providers, "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("recovered pickMixed error = %v", err)
+	}
+	if got == nil || got.ID != "third-party" || provider != "openai-compat" {
+		t.Fatalf("recovered pickMixed = (%v, %q), want third-party/openai-compat", got, provider)
+	}
+
+	thirdParty.Unavailable = true
+	thirdParty.NextRetryAfter = now.Add(2 * time.Minute)
+	scheduler.upsertAuth(thirdParty)
+	got, provider, err = scheduler.pickMixed(context.Background(), providers, "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("second fallback pickMixed error = %v", err)
+	}
+	if got == nil || got.ID != "codex-near" || provider != "codex" {
+		t.Fatalf("second fallback pickMixed = (%v, %q), want codex-near/codex", got, provider)
+	}
+}
