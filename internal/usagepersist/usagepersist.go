@@ -26,10 +26,12 @@ import (
 )
 
 const (
-	defaultQueryLimit      = 50000
-	queueSize              = 2048
-	cooldownQueueSize      = 1024
-	quotaSnapshotQueueSize = 1024
+	defaultQueryLimit              = 50000
+	queueSize                      = 2048
+	cooldownQueueSize              = 1024
+	quotaSnapshotQueueSize         = 1024
+	apiKeyUsageBucketSeconds int64 = 10 * 60
+	apiKeyUsageBucketCount         = 20
 )
 
 type Store struct {
@@ -135,6 +137,19 @@ type CredentialTokenUsage struct {
 	LastUsedAtMS    int64  `json:"last_used_at_ms,omitempty"`
 	CycleStartAt    string `json:"cycle_start_at,omitempty"`
 	CycleStartAtMS  int64  `json:"cycle_start_at_ms,omitempty"`
+}
+
+type RecentRequestBucket struct {
+	Time    string `json:"time"`
+	Success int64  `json:"success"`
+	Failed  int64  `json:"failed"`
+}
+
+type APIKeyUsageStats struct {
+	AuthIndex      string                `json:"auth_index"`
+	Success        int64                 `json:"success"`
+	Failed         int64                 `json:"failed"`
+	RecentRequests []RecentRequestBucket `json:"recent_requests"`
 }
 
 type ModelAggregate struct {
@@ -982,6 +997,159 @@ func (s *Store) QuotaSnapshots(ctx context.Context) ([]QuotaSnapshot, error) {
 
 func (s *Store) CredentialTokenUsages(ctx context.Context) ([]CredentialTokenUsage, error) {
 	return s.credentialTokenUsages(ctx, nil)
+}
+
+func APIKeyUsageStatsByAuthIndex(ctx context.Context, authIndexes []string, now time.Time) (map[string]APIKeyUsageStats, error) {
+	store := DefaultStore()
+	if store == nil {
+		return map[string]APIKeyUsageStats{}, nil
+	}
+	return store.APIKeyUsageStatsByAuthIndex(ctx, authIndexes, now)
+}
+
+func (s *Store) APIKeyUsageStatsByAuthIndex(ctx context.Context, authIndexes []string, now time.Time) (map[string]APIKeyUsageStats, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("usage store is closed")
+	}
+	authIndexes = normalizeAuthIndexList(authIndexes)
+	out := make(map[string]APIKeyUsageStats, len(authIndexes))
+	if len(authIndexes) == 0 {
+		return out, nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	currentBucketID := now.Unix() / apiKeyUsageBucketSeconds
+
+	placeholders := queryPlaceholders(len(authIndexes))
+	args := make([]any, 0, len(authIndexes))
+	for _, authIndex := range authIndexes {
+		args = append(args, authIndex)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `select
+		auth_index,
+		sum(case when failed = 0 then 1 else 0 end),
+		sum(case when failed != 0 then 1 else 0 end)
+		from usage_events
+		where auth_index in (`+placeholders+`)
+		group by auth_index`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var authIndex string
+		var success int64
+		var failed int64
+		if errScan := rows.Scan(&authIndex, &success, &failed); errScan != nil {
+			_ = rows.Close()
+			return nil, errScan
+		}
+		authIndex = strings.TrimSpace(authIndex)
+		out[authIndex] = APIKeyUsageStats{
+			AuthIndex:      authIndex,
+			Success:        success,
+			Failed:         failed,
+			RecentRequests: emptyAPIKeyUsageBuckets(currentBucketID),
+		}
+	}
+	if errRows := rows.Close(); errRows != nil {
+		return nil, errRows
+	}
+	if errRows := rows.Err(); errRows != nil {
+		return nil, errRows
+	}
+
+	bucketDurationMS := apiKeyUsageBucketSeconds * 1000
+	startBucketID := currentBucketID - int64(apiKeyUsageBucketCount) + 1
+	recentArgs := make([]any, 0, len(authIndexes)+4)
+	recentArgs = append(recentArgs, bucketDurationMS, startBucketID*bucketDurationMS, (currentBucketID+1)*bucketDurationMS)
+	for _, authIndex := range authIndexes {
+		recentArgs = append(recentArgs, authIndex)
+	}
+	recentArgs = append(recentArgs, bucketDurationMS)
+	rows, err = s.db.QueryContext(ctx, `select
+		auth_index,
+		cast(timestamp_ms / ? as integer),
+		sum(case when failed = 0 then 1 else 0 end),
+		sum(case when failed != 0 then 1 else 0 end)
+		from usage_events
+		where timestamp_ms >= ? and timestamp_ms < ? and auth_index in (`+placeholders+`)
+		group by auth_index, cast(timestamp_ms / ? as integer)`, recentArgs...)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var authIndex string
+		var bucketID int64
+		var success int64
+		var failed int64
+		if errScan := rows.Scan(&authIndex, &bucketID, &success, &failed); errScan != nil {
+			_ = rows.Close()
+			return nil, errScan
+		}
+		authIndex = strings.TrimSpace(authIndex)
+		stats, ok := out[authIndex]
+		if !ok {
+			continue
+		}
+		offset := int(bucketID - startBucketID)
+		if offset < 0 || offset >= len(stats.RecentRequests) {
+			continue
+		}
+		stats.RecentRequests[offset].Success = success
+		stats.RecentRequests[offset].Failed = failed
+		out[authIndex] = stats
+	}
+	if errRows := rows.Close(); errRows != nil {
+		return nil, errRows
+	}
+	return out, rows.Err()
+}
+
+func normalizeAuthIndexList(authIndexes []string) []string {
+	out := make([]string, 0, len(authIndexes))
+	seen := make(map[string]struct{}, len(authIndexes))
+	for _, authIndex := range authIndexes {
+		authIndex = strings.TrimSpace(authIndex)
+		if authIndex == "" {
+			continue
+		}
+		if _, ok := seen[authIndex]; ok {
+			continue
+		}
+		seen[authIndex] = struct{}{}
+		out = append(out, authIndex)
+	}
+	return out
+}
+
+func queryPlaceholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	parts := make([]string, count)
+	for i := range parts {
+		parts[i] = "?"
+	}
+	return strings.Join(parts, ",")
+}
+
+func emptyAPIKeyUsageBuckets(currentBucketID int64) []RecentRequestBucket {
+	out := make([]RecentRequestBucket, 0, apiKeyUsageBucketCount)
+	for i := apiKeyUsageBucketCount - 1; i >= 0; i-- {
+		bucketID := currentBucketID - int64(i)
+		out = append(out, RecentRequestBucket{
+			Time: formatAPIKeyUsageBucketLabel(bucketID),
+		})
+	}
+	return out
+}
+
+func formatAPIKeyUsageBucketLabel(bucketID int64) string {
+	start := time.Unix(bucketID*apiKeyUsageBucketSeconds, 0).In(time.Local)
+	end := start.Add(time.Duration(apiKeyUsageBucketSeconds) * time.Second)
+	return start.Format("15:04") + "-" + end.Format("15:04")
 }
 
 func (s *Store) CredentialTokenUsagesForQuotaSnapshots(ctx context.Context, snapshots []QuotaSnapshot) ([]CredentialTokenUsage, error) {

@@ -6,13 +6,22 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagepersist"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 type apiKeyUsageEntry struct {
 	Success        int64                          `json:"success"`
 	Failed         int64                          `json:"failed"`
 	RecentRequests []coreauth.RecentRequestBucket `json:"recent_requests"`
+}
+
+type apiKeyUsageAuth struct {
+	auth         *coreauth.Auth
+	provider     string
+	compositeKey string
+	authIndex    string
 }
 
 func mergeRecentRequestBuckets(dst, src []coreauth.RecentRequestBucket) []coreauth.RecentRequestBucket {
@@ -40,6 +49,21 @@ func mergeRecentRequestBuckets(dst, src []coreauth.RecentRequestBucket) []coreau
 	return dst
 }
 
+func coreRecentRequestBuckets(buckets []usagepersist.RecentRequestBucket) []coreauth.RecentRequestBucket {
+	if len(buckets) == 0 {
+		return nil
+	}
+	out := make([]coreauth.RecentRequestBucket, 0, len(buckets))
+	for _, bucket := range buckets {
+		out = append(out, coreauth.RecentRequestBucket{
+			Time:    bucket.Time,
+			Success: bucket.Success,
+			Failed:  bucket.Failed,
+		})
+	}
+	return out
+}
+
 // GetAPIKeyUsage returns recent request buckets for all in-memory api_key auths,
 // grouped by provider and keyed by "base_url|api_key".
 func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
@@ -57,7 +81,8 @@ func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 	}
 
 	now := time.Now()
-	out := make(map[string]map[string]apiKeyUsageEntry)
+	auths := make([]apiKeyUsageAuth, 0)
+	authIndexes := make([]string, 0)
 	for _, auth := range manager.List() {
 		if auth == nil {
 			continue
@@ -82,23 +107,65 @@ func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 		if provider == "" {
 			provider = "unknown"
 		}
+		authIndex := strings.TrimSpace(auth.EnsureIndex())
+		auths = append(auths, apiKeyUsageAuth{
+			auth:         auth,
+			provider:     provider,
+			compositeKey: compositeKey,
+			authIndex:    authIndex,
+		})
+		if authIndex != "" {
+			authIndexes = append(authIndexes, authIndex)
+		}
+	}
 
+	persisted, errPersisted := usagepersist.APIKeyUsageStatsByAuthIndex(c.Request.Context(), authIndexes, now)
+	if errPersisted != nil {
+		log.WithError(errPersisted).Warn("failed to load persisted api key usage stats")
+		persisted = nil
+	}
+
+	out := make(map[string]map[string]apiKeyUsageEntry)
+	seenPersisted := make(map[string]map[string]struct{})
+	for _, item := range auths {
+		auth := item.auth
 		recent := auth.RecentRequestsSnapshot(now)
-		providerBucket, ok := out[provider]
+		success := auth.Success
+		failed := auth.Failed
+		usePersisted := false
+		if stats, ok := persisted[item.authIndex]; ok {
+			usageKey := item.provider + "|" + item.compositeKey
+			if seenPersisted[usageKey] == nil {
+				seenPersisted[usageKey] = make(map[string]struct{})
+			}
+			if _, seen := seenPersisted[usageKey][item.authIndex]; seen {
+				continue
+			}
+			seenPersisted[usageKey][item.authIndex] = struct{}{}
+			success = stats.Success
+			failed = stats.Failed
+			recent = coreRecentRequestBuckets(stats.RecentRequests)
+			usePersisted = true
+		}
+		if !usePersisted && strings.TrimSpace(item.authIndex) == "" {
+			recent = auth.RecentRequestsSnapshot(now)
+		}
+
+		providerBucket, ok := out[item.provider]
 		if !ok {
 			providerBucket = make(map[string]apiKeyUsageEntry)
-			out[provider] = providerBucket
+			out[item.provider] = providerBucket
 		}
-		if existing, exists := providerBucket[compositeKey]; exists {
-			existing.Success += auth.Success
-			existing.Failed += auth.Failed
+		if existing, exists := providerBucket[item.compositeKey]; exists {
+			existing.Success += success
+			existing.Failed += failed
 			existing.RecentRequests = mergeRecentRequestBuckets(existing.RecentRequests, recent)
-			providerBucket[compositeKey] = existing
+			providerBucket[item.compositeKey] = existing
 			continue
 		}
-		providerBucket[compositeKey] = apiKeyUsageEntry{
-			Success:        auth.Success,
-			Failed:         auth.Failed,
+		providerBucket[item.compositeKey] = apiKeyUsageEntry{
+			Success:        success,
+			Failed:         failed,
 			RecentRequests: recent,
 		}
 	}
