@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -30,6 +31,8 @@ const (
 	defaultPollMaxWait          = 10 * time.Minute
 	defaultPollRateLimitBudget  = 2 * time.Minute
 	defaultPollRateLimitBackoff = 30 * time.Second
+	webImageProxyURLEnv         = "CLI_PROXY_WEB_IMAGE_PROXY_URL"
+	shortWebImageProxyURLEnv    = "WEB_IMAGE_PROXY_URL"
 )
 
 type Backend struct {
@@ -105,20 +108,30 @@ type ChatGPTClient struct {
 	pollRateLimitBudget time.Duration
 }
 
+func resolveWebImageProxyURL(auth *coreauth.Auth, cfg *sdkconfig.SDKConfig) string {
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+			return proxyURL
+		}
+	}
+	for _, key := range []string{webImageProxyURLEnv, shortWebImageProxyURLEnv} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
+}
+
 func newChatGPTClient(auth *coreauth.Auth, cfg *sdkconfig.SDKConfig) (*ChatGPTClient, error) {
 	accessToken := metadataString(auth, "access_token")
 	if accessToken == "" {
 		return nil, &statusError{statusCode: http.StatusUnauthorized, message: "codex oauth access token is missing"}
 	}
 
-	proxyURL := ""
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-
+	proxyURL := resolveWebImageProxyURL(auth, cfg)
 	apiTransport, err := newChromeTransport(proxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("create chatgpt chrome transport: %w", err)

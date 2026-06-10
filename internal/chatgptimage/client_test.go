@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -34,6 +37,53 @@ func (r *errorAfterReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return 0, io.EOF
+}
+
+func TestResolveWebImageProxyURLPriority(t *testing.T) {
+	t.Setenv(webImageProxyURLEnv, "socks5://env.example.com:1080")
+	t.Setenv(shortWebImageProxyURLEnv, "socks5://short.example.com:1080")
+
+	got := resolveWebImageProxyURL(
+		&coreauth.Auth{ProxyURL: "socks5://auth.example.com:1080"},
+		&sdkconfig.SDKConfig{ProxyURL: "socks5://global.example.com:1080"},
+	)
+	if got != "socks5://auth.example.com:1080" {
+		t.Fatalf("proxy = %q, want auth proxy", got)
+	}
+}
+
+func TestResolveWebImageProxyURLKeepsExplicitDirectAuthProxy(t *testing.T) {
+	t.Setenv(webImageProxyURLEnv, "socks5://env.example.com:1080")
+
+	got := resolveWebImageProxyURL(
+		&coreauth.Auth{ProxyURL: "direct"},
+		&sdkconfig.SDKConfig{ProxyURL: "socks5://global.example.com:1080"},
+	)
+	if got != "direct" {
+		t.Fatalf("proxy = %q, want direct auth proxy", got)
+	}
+}
+
+func TestResolveWebImageProxyURLUsesDedicatedEnvBeforeGlobalConfig(t *testing.T) {
+	t.Setenv(webImageProxyURLEnv, "socks5://admin:123456@127.0.0.1:1080")
+
+	got := resolveWebImageProxyURL(
+		&coreauth.Auth{},
+		&sdkconfig.SDKConfig{ProxyURL: "socks5://global.example.com:1080"},
+	)
+	if got != "socks5://admin:123456@127.0.0.1:1080" {
+		t.Fatalf("proxy = %q, want dedicated env proxy", got)
+	}
+}
+
+func TestResolveWebImageProxyURLUsesShortEnvAlias(t *testing.T) {
+	t.Setenv(webImageProxyURLEnv, "")
+	t.Setenv(shortWebImageProxyURLEnv, "socks5://short.example.com:1080")
+
+	got := resolveWebImageProxyURL(&coreauth.Auth{}, nil)
+	if got != "socks5://short.example.com:1080" {
+		t.Fatalf("proxy = %q, want short env alias", got)
+	}
 }
 
 func TestParseSSEWithoutAsyncRecoversFromConversation(t *testing.T) {

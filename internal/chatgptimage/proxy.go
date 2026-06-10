@@ -29,6 +29,10 @@ func newHTTPTransport(raw string) (*http.Transport, error) {
 	if trimmed == "" {
 		return transport, nil
 	}
+	if isExplicitDirectProxySetting(trimmed) {
+		transport.Proxy = nil
+		return transport, nil
+	}
 
 	parsed, err := url.Parse(trimmed)
 	if err != nil {
@@ -55,7 +59,7 @@ func newHTTPTransport(raw string) (*http.Transport, error) {
 func newTunnelDialContext(raw string) (func(context.Context, string, string) (net.Conn, error), error) {
 	direct := (&net.Dialer{Timeout: defaultConnectTimeout}).DialContext
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	if trimmed == "" || isExplicitDirectProxySetting(trimmed) {
 		return direct, nil
 	}
 
@@ -78,6 +82,10 @@ func newTunnelDialContext(raw string) (func(context.Context, string, string) (ne
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme %q", parsed.Scheme)
 	}
+}
+
+func isExplicitDirectProxySetting(value string) bool {
+	return strings.EqualFold(value, "direct") || strings.EqualFold(value, "none")
 }
 
 func newSOCKSContextDialer(parsed *url.URL) (xproxy.ContextDialer, error) {
