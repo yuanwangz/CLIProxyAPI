@@ -629,7 +629,8 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 
 	if isDefaultImagesToolModel(imageModel) {
 		imageReq := buildOpenAICompatImagesJSONRequest(rawJSON, imageModel, stream)
-		h.handleRoutedImages(c, imageReq, imageModel, stream)
+		fallbackReq := buildImageGenerationFallbackRequest(rawJSON, responseFormat)
+		h.handleRoutedImagesWithFallback(c, imageReq, imageModel, responseFormat, "image_generation", fallbackReq, stream)
 		return
 	}
 	if isXAIImagesModel(imageModel) {
@@ -779,8 +780,18 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 			})
 			return
 		}
+		fallbackReq, errFallbackReq := buildImageEditMultipartFallbackRequest(form, responseFormat)
+		if errFallbackReq != nil {
+			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+				Error: handlers.ErrorDetail{
+					Message: fmt.Sprintf("Invalid request: %v", errFallbackReq),
+					Type:    "invalid_request_error",
+				},
+			})
+			return
+		}
 		c.Request.Header.Set("Content-Type", contentType)
-		h.handleRoutedImages(c, imageReq, imageModel, stream)
+		h.handleRoutedImagesWithFallback(c, imageReq, imageModel, responseFormat, "image_edit", fallbackReq, stream)
 		return
 	}
 	if isXAIImagesModel(imageModel) {
@@ -908,7 +919,8 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 
 	if isDefaultImagesToolModel(imageModel) {
 		imageReq := buildOpenAICompatImagesJSONRequest(rawJSON, imageModel, stream)
-		h.handleRoutedImages(c, imageReq, imageModel, stream)
+		fallbackReq := buildImageEditJSONFallbackRequest(rawJSON, responseFormat)
+		h.handleRoutedImagesWithFallback(c, imageReq, imageModel, responseFormat, "image_edit", fallbackReq, stream)
 		return
 	}
 	if isXAIImagesModel(imageModel) {
@@ -1121,125 +1133,6 @@ func (h *OpenAIAPIHandler) handleOpenAICompatImages(c *gin.Context, compatReq []
 		return
 	}
 	h.collectImagesWithModel(c, compatReq, imageModel, responseFormat)
-}
-
-func (h *OpenAIAPIHandler) handleRoutedImages(c *gin.Context, imageReq []byte, imageModel string, stream bool) {
-	if stream {
-		h.streamRoutedImages(c, imageReq, imageModel)
-		return
-	}
-	h.collectRoutedImages(c, imageReq, imageModel)
-}
-
-func (h *OpenAIAPIHandler) collectRoutedImages(c *gin.Context, imageReq []byte, imageModel string) {
-	c.Header("Content-Type", "application/json")
-
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
-	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
-
-	model := strings.TrimSpace(imageModel)
-	resp, upstreamHeaders, errMsg := h.ExecuteImageWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
-	stopKeepAlive()
-	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
-		if errMsg.Error != nil {
-			cliCancel(errMsg.Error)
-		} else {
-			cliCancel(nil)
-		}
-		return
-	}
-
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write(resp)
-	cliCancel(nil)
-}
-
-func (h *OpenAIAPIHandler) streamRoutedImages(c *gin.Context, imageReq []byte, imageModel string) {
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "Streaming not supported",
-				Type:    "server_error",
-			},
-		})
-		return
-	}
-
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
-	model := strings.TrimSpace(imageModel)
-	execution, streamStarted, canceled := h.waitImagesStreamExecution(c, flusher, func() imagesStreamExecutionResult {
-		dataChan, upstreamHeaders, errChan := h.ExecuteImageStreamWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
-		return imagesStreamExecutionResult{Data: dataChan, UpstreamHeaders: upstreamHeaders, Errs: errChan}
-	})
-	if canceled {
-		cliCancel(c.Request.Context().Err())
-		return
-	}
-	dataChan := execution.Data
-	upstreamHeaders := execution.UpstreamHeaders
-	errChan := execution.Errs
-	keepAlive, keepAliveC := h.newImagesStreamKeepAliveTicker()
-	stopKeepAlive := func() {
-		if keepAlive != nil {
-			keepAlive.Stop()
-			keepAlive = nil
-			keepAliveC = nil
-		}
-	}
-	defer stopKeepAlive()
-
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cliCancel(c.Request.Context().Err())
-			return
-		case errMsg, ok := <-errChan:
-			if !ok {
-				errChan = nil
-				continue
-			}
-			if streamStarted {
-				writeImagesStreamErrorEvent(c, errMsg)
-				flusher.Flush()
-			} else {
-				h.WriteErrorResponse(c, errMsg)
-			}
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
-			}
-			return
-		case chunk, ok := <-dataChan:
-			if !ok {
-				stopKeepAlive()
-				setImagesSSEHeaders(c)
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = c.Writer.Write([]byte("\n"))
-				flusher.Flush()
-				cliCancel(nil)
-				return
-			}
-
-			stopKeepAlive()
-			setImagesSSEHeaders(c)
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-			_, _ = c.Writer.Write(chunk)
-			flusher.Flush()
-			streamStarted = true
-			h.forwardRawImageStream(cliCtx, c, func(err error) { cliCancel(err) }, dataChan, errChan)
-			return
-		case <-keepAliveC:
-			setImagesSSEHeaders(c)
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-			writeImagesStreamKeepAlive(c, flusher)
-			streamStarted = true
-		}
-	}
 }
 
 func (h *OpenAIAPIHandler) forwardRawImageStream(ctx context.Context, c *gin.Context, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {

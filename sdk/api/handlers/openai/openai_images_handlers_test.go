@@ -2,6 +2,7 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -10,11 +11,15 @@ import (
 	"net/textproto"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/imagesfallback"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
@@ -260,6 +265,76 @@ func TestBuildImagesAPIResponseFromXAI(t *testing.T) {
 	}
 }
 
+func TestImagesGenerationsDefaultModelFallsBackAfterRoutedProviderFailure(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	primaryExecutor := &failingImagesExecutor{id: "openai-compatibility", status: http.StatusInternalServerError}
+	manager.RegisterExecutor(primaryExecutor)
+
+	primaryAuth := &coreauth.Auth{ID: "test-images-primary-auth", Provider: "openai-compatibility"}
+	fallbackAuth := &coreauth.Auth{
+		ID:       "test-images-codex-oauth",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email":        "images@example.com",
+			"access_token": "token",
+		},
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(primaryAuth.ID, "openai-compatibility", []*registry.ModelInfo{
+		{ID: defaultImagesToolModel, Object: "model", OwnedBy: "compat", Type: registry.OpenAIImageModelType},
+	})
+	t.Cleanup(func() {
+		reg.UnregisterClient(primaryAuth.ID)
+	})
+
+	if _, err := manager.Register(context.Background(), primaryAuth); err != nil {
+		t.Fatalf("register primary auth: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), fallbackAuth); err != nil {
+		t.Fatalf("register fallback auth: %v", err)
+	}
+
+	fallbackService := &fakeImagesFallbackService{
+		result: &imagesfallback.Result{
+			CreatedAt: time.Now().Unix(),
+			Images: []imagesfallback.GeneratedImage{
+				{Data: []byte("image"), MIMEType: "image/png", RevisedPrompt: "refined"},
+			},
+		},
+	}
+	previousFactory := newImageFallbackService
+	newImageFallbackService = func(*sdkconfig.SDKConfig, *coreauth.Manager) imageFallbackService {
+		return fallbackService
+	}
+	t.Cleanup(func() {
+		newImageFallbackService = previousFactory
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	body := strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a square","response_format":"b64_json"}`)
+
+	resp := performImagesEndpointRequest(t, imagesGenerationsPath, "application/json", body, handler.ImagesGenerations)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if primaryExecutor.Calls() != 1 {
+		t.Fatalf("primary executor calls = %d, want 1", primaryExecutor.Calls())
+	}
+	if fallbackService.Calls() != 1 {
+		t.Fatalf("fallback service calls = %d, want 1", fallbackService.Calls())
+	}
+	if got := gjson.GetBytes(resp.Body.Bytes(), "data.0.b64_json").String(); got != "aW1hZ2U=" {
+		t.Fatalf("fallback b64_json = %q, want image payload", got)
+	}
+	if got := gjson.GetBytes(resp.Body.Bytes(), "data.0.revised_prompt").String(); got != "refined" {
+		t.Fatalf("revised_prompt = %q, want refined", got)
+	}
+}
+
 func TestImagesGenerationsRejectsUnsupportedModel(t *testing.T) {
 	handler := &OpenAIAPIHandler{}
 	body := strings.NewReader(`{"model":"gpt-5.4-mini","prompt":"draw a square"}`)
@@ -343,4 +418,74 @@ func TestImagesEdits_DisableImageGenerationChat_DoesNotReturn404(t *testing.T) {
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
 	}
+}
+
+type failingImagesExecutor struct {
+	id     string
+	status int
+	calls  int
+}
+
+func (e *failingImagesExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *failingImagesExecutor) Execute(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls++
+	return cliproxyexecutor.Response{}, &testImagesStatusError{status: e.status, message: "primary image provider failed"}
+}
+
+func (e *failingImagesExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.calls++
+	return nil, &testImagesStatusError{status: e.status, message: "primary image provider failed"}
+}
+
+func (e *failingImagesExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *failingImagesExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &testImagesStatusError{status: e.status, message: "primary image provider failed"}
+}
+
+func (e *failingImagesExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *failingImagesExecutor) Calls() int {
+	return e.calls
+}
+
+type testImagesStatusError struct {
+	status  int
+	message string
+}
+
+func (e *testImagesStatusError) Error() string {
+	return e.message
+}
+
+func (e *testImagesStatusError) StatusCode() int {
+	return e.status
+}
+
+type fakeImagesFallbackService struct {
+	result *imagesfallback.Result
+	err    error
+	calls  int
+}
+
+func (s *fakeImagesFallbackService) ExecuteWithAuthManager(_ context.Context, _ imagesfallback.Request, selectedCallback func(string)) (*imagesfallback.Result, error) {
+	s.calls++
+	if selectedCallback != nil {
+		selectedCallback("test-images-codex-oauth")
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.result, nil
+}
+
+func (s *fakeImagesFallbackService) Calls() int {
+	return s.calls
 }
