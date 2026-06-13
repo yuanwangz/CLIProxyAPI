@@ -51,6 +51,19 @@ import (
 
 const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
 
+var corsExposedResponseHeaders = []string{
+	"X-CPA-VERSION",
+	"X-CPA-COMMIT",
+	"X-CPA-BUILD-DATE",
+	"X-CPA-SUPPORT-PLUGIN",
+	"X-CPA-HOME-VERSION",
+	"X-CPA-HOME-BUILD-DATE",
+	"X-SERVER-VERSION",
+	"X-SERVER-BUILD-DATE",
+}
+
+var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, ", ")
+
 type serverOptionConfig struct {
 	extraMiddleware      []gin.HandlerFunc
 	engineConfigurator   func(*gin.Engine)
@@ -63,6 +76,7 @@ type serverOptionConfig struct {
 	postAuthHook         auth.PostAuthHook
 	postAuthPersistHook  auth.PostAuthHook
 	pluginHost           *pluginhost.Host
+	configReloadHook     func(context.Context, *config.Config)
 }
 
 // ServerOption customises HTTP server construction.
@@ -152,6 +166,13 @@ func WithPostAuthPersistHook(hook auth.PostAuthHook) ServerOption {
 func WithPluginHost(host *pluginhost.Host) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.pluginHost = host
+	}
+}
+
+// WithConfigReloadHook registers a callback used after management saves config changes.
+func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.configReloadHook = hook
 	}
 }
 
@@ -301,6 +322,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		pluginHost:          optionState.pluginHost,
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
+	s.handlers.SetPluginHost(optionState.pluginHost)
+	if optionState.pluginHost != nil {
+		optionState.pluginHost.SetModelExecutor(s.handlers)
+	}
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 	s.applyAccessConfig(nil, cfg)
@@ -313,6 +338,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
+	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -382,7 +408,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
 				c.Next()
 				return
 			}
@@ -605,7 +631,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
 		mgmt.GET("/plugins", s.mgmt.ListPlugins)
+		mgmt.GET("/plugin-store", s.mgmt.ListPluginStore)
+		mgmt.POST("/plugin-store/:id/install", s.mgmt.InstallPluginFromStore)
+		mgmt.DELETE("/plugins/:id", s.mgmt.DeletePlugin)
 		mgmt.PATCH("/plugins/:id/enabled", s.mgmt.PatchPluginEnabled)
+		mgmt.GET("/plugins/:id/config", s.mgmt.GetPluginConfig)
 		mgmt.PUT("/plugins/:id/config", s.mgmt.PutPluginConfig)
 		mgmt.PATCH("/plugins/:id/config", s.mgmt.PatchPluginConfig)
 
@@ -818,6 +848,10 @@ func (s *Server) pluginManagementNoRoute(c *gin.Context) {
 		return
 	}
 	path := c.Request.URL.Path
+	if strings.HasPrefix(path, "/v0/resource/plugins/") {
+		s.pluginResourceNoRoute(c)
+		return
+	}
 	if path != "/v0/management" && !strings.HasPrefix(path, "/v0/management/") {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
@@ -838,6 +872,24 @@ func (s *Server) pluginManagementNoRoute(c *gin.Context) {
 		return
 	}
 	if s.pluginHost.ServeManagementHTTP(c.Writer, c.Request) {
+		c.Abort()
+		return
+	}
+	c.AbortWithStatus(http.StatusNotFound)
+}
+
+func (s *Server) pluginResourceNoRoute(c *gin.Context) {
+	if s == nil || c == nil || c.Request == nil || c.Request.URL == nil {
+		if c != nil {
+			c.AbortWithStatus(http.StatusNotFound)
+		}
+		return
+	}
+	if s.cfg == nil || s.cfg.Home.Enabled || s.pluginHost == nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	if s.pluginHost.ServeResourceHTTP(c.Writer, c.Request) {
 		c.Abort()
 		return
 	}
@@ -1436,6 +1488,7 @@ func corsMiddleware() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "*")
+		c.Header("Access-Control-Expose-Headers", corsExposedResponseHeadersJoined)
 
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -1571,6 +1624,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 
 	s.handlers.UpdateClients(effectiveSDKConfig(cfg))
+	s.handlers.SetPluginHost(s.pluginHost)
+	if s.pluginHost != nil {
+		s.pluginHost.SetModelExecutor(s.handlers)
+	}
 
 	if s.mgmt != nil {
 		s.mgmt.SetConfig(cfg)
