@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,5 +179,164 @@ func TestGetAPIKeyUsage_RestoresPersistedStatsAfterRestart(t *testing.T) {
 	success, failed := sumRecentRequestBuckets(entry.RecentRequests)
 	if success != 1 || failed != 1 {
 		t.Fatalf("persisted bucket totals = %d/%d, want 1/1", success, failed)
+	}
+}
+
+func TestGetAPIKeyUsage_IncludesAPIKeyCooldownStatus(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+	coreauth.SetQuotaCooldownDisabled(false)
+	t.Cleanup(func() {
+		coreauth.SetQuotaCooldownDisabled(false)
+	})
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	authRecord := &coreauth.Auth{
+		ID:       "claude-cooldown-auth",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":  "claude-key",
+			"base_url": "https://claude.example.com",
+		},
+	}
+	if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), authRecord); err != nil {
+		t.Fatalf("register claude auth: %v", err)
+	}
+	authIndex := authRecord.EnsureIndex()
+	retryAfter := 5 * time.Minute
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:     "claude-cooldown-auth",
+		Provider:   "claude",
+		Model:      "claude-opus-4-8",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &coreauth.Error{
+			Message:    "rate limit exceeded",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/api-key-usage", nil)
+	ginCtx.Request = req
+	h.GetAPIKeyUsage(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var payload map[string]map[string]apiKeyUsageEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+
+	entry := payload["claude"]["https://claude.example.com|claude-key"]
+	if entry.AuthID != "claude-cooldown-auth" || entry.AuthIndex != authIndex {
+		t.Fatalf("auth identity = %q/%q, want claude-cooldown-auth/%s", entry.AuthID, entry.AuthIndex, authIndex)
+	}
+	if !entry.Blocked || !entry.Cooling || entry.BlockReason != "quota" {
+		t.Fatalf("cooldown status = blocked:%v cooling:%v reason:%q, want quota cooldown", entry.Blocked, entry.Cooling, entry.BlockReason)
+	}
+	if entry.NextRetryMS == 0 || entry.NextRetryAfter == "" {
+		t.Fatalf("next retry not populated: %+v", entry)
+	}
+	if len(entry.ModelStates) != 1 || entry.ModelStates[0].Model != "claude-opus-4-8" {
+		t.Fatalf("model states = %+v, want claude-opus-4-8", entry.ModelStates)
+	}
+	if !entry.ModelStates[0].Cooling || entry.ModelStates[0].StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("model cooldown = %+v, want 429 quota cooldown", entry.ModelStates[0])
+	}
+}
+
+func TestClearAPIKeyUsageCooldown_ClearsOnlyQuotaCooldown(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+	coreauth.SetQuotaCooldownDisabled(false)
+	t.Cleanup(func() {
+		coreauth.SetQuotaCooldownDisabled(false)
+	})
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	authRecord := &coreauth.Auth{
+		ID:       "claude-clear-auth",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":  "claude-key",
+			"base_url": "https://claude.example.com",
+		},
+	}
+	if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), authRecord); err != nil {
+		t.Fatalf("register claude auth: %v", err)
+	}
+	authIndex := authRecord.EnsureIndex()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	retryAfter := 5 * time.Minute
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:     "claude-clear-auth",
+		Provider:   "claude",
+		Model:      "claude-opus-4-8",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &coreauth.Error{
+			Message:    "rate limit exceeded",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	body := `{"provider":"claude","auth_index":"` + authIndex + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/api-key-usage/clear-cooldown", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ginCtx.Request = req
+	h.ClearAPIKeyUsageCooldown(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	updated, ok := manager.GetByID("claude-clear-auth")
+	if !ok {
+		t.Fatal("updated auth not found")
+	}
+	if updated.Quota.Exceeded || updated.Unavailable || len(updated.ModelStates) != 0 {
+		t.Fatalf("quota cooldown should be cleared, got %+v", updated)
+	}
+
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:   "claude-clear-auth",
+		Provider: "claude",
+		Model:    "claude-opus-4-8",
+		Success:  false,
+		Error: &coreauth.Error{
+			Message:    "model not found",
+			HTTPStatus: http.StatusNotFound,
+		},
+	})
+
+	rec = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(rec)
+	req = httptest.NewRequest(http.MethodPost, "/v0/management/api-key-usage/clear-cooldown", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ginCtx.Request = req
+	h.ClearAPIKeyUsageCooldown(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear not_found status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	updated, ok = manager.GetByID("claude-clear-auth")
+	if !ok {
+		t.Fatal("updated auth after not_found not found")
+	}
+	state := updated.ModelStates["claude-opus-4-8"]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("not_found model state should remain blocked, got %+v", state)
+	}
+	if state.Quota.Exceeded {
+		t.Fatalf("not_found model state should not be quota cooldown, got %+v", state)
 	}
 }
