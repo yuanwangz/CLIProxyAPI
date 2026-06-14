@@ -472,6 +472,14 @@ func ClearCooldownAsync(authID, model string) {
 	})
 }
 
+func ClearCooldown(ctx context.Context, authID, model string) error {
+	store := DefaultStore()
+	if store == nil {
+		return nil
+	}
+	return store.DeleteCooldown(ctx, authID, model)
+}
+
 func ClearAuthCooldownsAsync(authID string) {
 	enqueueCooldownCommand(cooldownCommand{
 		action: "delete-auth",

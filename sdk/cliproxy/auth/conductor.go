@@ -479,6 +479,87 @@ func (m *Manager) ClearQuotaCooldownState(ctx context.Context, authID string) {
 	m.hook.OnAuthUpdated(ctx, snapshot.Clone())
 }
 
+// ClearRecoverableAvailabilityState clears operator-retryable runtime blocks for
+// one auth. It keeps disabled and 401 unauthorized states intact, but clears
+// transient/model-level pauses such as 429 quota cooldowns and 404/model
+// support suspensions so operators can retry after fixing provider config.
+//
+// The returned slice contains cleared model keys. An empty string means an
+// auth-level cooldown row was cleared.
+func (m *Manager) ClearRecoverableAvailabilityState(ctx context.Context, authID string) []string {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return nil
+	}
+
+	authID = strings.TrimSpace(authID)
+	now := time.Now()
+	clearedModes := make([]string, 0)
+	var snapshot *Auth
+
+	m.mu.Lock()
+	auth, ok := m.auths[authID]
+	if ok && auth != nil && !auth.Disabled && auth.Status != StatusDisabled {
+		changed := false
+
+		if authHasRecoverableAvailabilityBlock(auth) {
+			auth.Quota = QuotaState{}
+			auth.NextRetryAfter = time.Time{}
+			auth.Unavailable = false
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
+			clearedModes = append(clearedModes, "")
+			changed = true
+		}
+
+		for modelKey, state := range auth.ModelStates {
+			if !modelStateHasRecoverableAvailabilityBlock(state) {
+				continue
+			}
+			resetModelState(state, now)
+			clearedModes = append(clearedModes, strings.TrimSpace(modelKey))
+			if modelStateIsClean(state) {
+				delete(auth.ModelStates, modelKey)
+			}
+			changed = true
+		}
+
+		if changed {
+			if len(auth.ModelStates) == 0 {
+				auth.ModelStates = nil
+				clearAggregatedAvailability(auth)
+			} else {
+				updateAggregatedAvailability(auth, now)
+			}
+			if !hasModelError(auth, now) && auth.LastError == nil {
+				auth.StatusMessage = ""
+				auth.Status = StatusActive
+			}
+			auth.UpdatedAt = now
+			if errPersist := m.persist(ctx, auth); errPersist != nil {
+				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes while clearing recoverable availability state: %v", errPersist)
+			}
+			snapshot = auth.Clone()
+		}
+	}
+	m.mu.Unlock()
+
+	if snapshot == nil {
+		return nil
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	for _, model := range clearedModes {
+		if model != "" {
+			registry.GetGlobalRegistry().ClearModelQuotaExceeded(authID, model)
+			registry.GetGlobalRegistry().ResumeClientModel(authID, model)
+		}
+	}
+	m.hook.OnAuthUpdated(ctx, snapshot.Clone())
+	return clearedModes
+}
+
 func (m *Manager) SetSelector(selector Selector) {
 	if m == nil {
 		return
@@ -3044,6 +3125,38 @@ func modelStateHasQuotaCooldown(state *ModelState) bool {
 	return statusMessageIsQuotaCooldown(state.StatusMessage)
 }
 
+func authHasRecoverableAvailabilityBlock(auth *Auth) bool {
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		return false
+	}
+	if errorIsUnauthorized(auth.LastError) {
+		return false
+	}
+	if authHasQuotaCooldown(auth) {
+		return true
+	}
+	if auth.Unavailable || !auth.NextRetryAfter.IsZero() {
+		return true
+	}
+	return auth.Status == StatusError && (strings.TrimSpace(auth.StatusMessage) != "" || auth.LastError != nil)
+}
+
+func modelStateHasRecoverableAvailabilityBlock(state *ModelState) bool {
+	if state == nil || state.Status == StatusDisabled {
+		return false
+	}
+	if errorIsUnauthorized(state.LastError) {
+		return false
+	}
+	if modelStateHasQuotaCooldown(state) {
+		return true
+	}
+	if state.Unavailable || !state.NextRetryAfter.IsZero() {
+		return true
+	}
+	return state.Status == StatusError && (strings.TrimSpace(state.StatusMessage) != "" || state.LastError != nil)
+}
+
 func quotaStateHasCooldown(quota QuotaState) bool {
 	return quota.Exceeded ||
 		strings.EqualFold(strings.TrimSpace(quota.Reason), "quota") ||
@@ -3059,6 +3172,10 @@ func errorIsQuotaCooldown(err *Error) bool {
 		return true
 	}
 	return quotaTextIndicatesCooldown(err.Code) || quotaTextIndicatesCooldown(err.Message)
+}
+
+func errorIsUnauthorized(err *Error) bool {
+	return err != nil && err.StatusCode() == http.StatusUnauthorized
 }
 
 func statusMessageIsQuotaCooldown(message string) bool {

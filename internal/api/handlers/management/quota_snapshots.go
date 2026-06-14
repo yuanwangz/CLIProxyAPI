@@ -124,6 +124,10 @@ func (h *Handler) clearQuotaCooldownState(ctx context.Context, snapshot usageper
 }
 
 func (h *Handler) canClearQuotaCooldownState(authID string) bool {
+	return h.canClearRecoverableAvailabilityState(authID)
+}
+
+func (h *Handler) canClearRecoverableAvailabilityState(authID string) bool {
 	if h == nil || h.authManager == nil {
 		return true
 	}

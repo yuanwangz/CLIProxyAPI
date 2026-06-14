@@ -251,7 +251,7 @@ func TestGetAPIKeyUsage_IncludesAPIKeyCooldownStatus(t *testing.T) {
 	}
 }
 
-func TestClearAPIKeyUsageCooldown_ClearsOnlyQuotaCooldown(t *testing.T) {
+func TestClearAPIKeyUsageCooldown_ClearsRecoverableBlocks(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 	coreauth.SetQuotaCooldownDisabled(false)
@@ -332,11 +332,36 @@ func TestClearAPIKeyUsageCooldown_ClearsOnlyQuotaCooldown(t *testing.T) {
 	if !ok {
 		t.Fatal("updated auth after not_found not found")
 	}
-	state := updated.ModelStates["claude-opus-4-8"]
-	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
-		t.Fatalf("not_found model state should remain blocked, got %+v", state)
+	if len(updated.ModelStates) != 0 || updated.Unavailable || updated.Status != coreauth.StatusActive {
+		t.Fatalf("not_found model state should be cleared, got %+v", updated)
 	}
-	if state.Quota.Exceeded {
-		t.Fatalf("not_found model state should not be quota cooldown, got %+v", state)
+
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:   "claude-clear-auth",
+		Provider: "claude",
+		Model:    "claude-opus-4-8",
+		Success:  false,
+		Error: &coreauth.Error{
+			Message:    "unauthorized",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	rec = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(rec)
+	req = httptest.NewRequest(http.MethodPost, "/v0/management/api-key-usage/clear-cooldown", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ginCtx.Request = req
+	h.ClearAPIKeyUsageCooldown(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear unauthorized status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	updated, ok = manager.GetByID("claude-clear-auth")
+	if !ok {
+		t.Fatal("updated auth after unauthorized not found")
+	}
+	if !updated.Disabled || updated.Status != coreauth.StatusDisabled || updated.StatusMessage != "unauthorized" {
+		t.Fatalf("unauthorized state should remain disabled, got %+v", updated)
 	}
 }

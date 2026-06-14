@@ -489,7 +489,8 @@ func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-// ClearAPIKeyUsageCooldown clears quota/429 cooldown state for API-key-backed auths.
+// ClearAPIKeyUsageCooldown clears operator-retryable availability blocks for
+// API-key-backed auths. It keeps disabled and 401 unauthorized states intact.
 func (h *Handler) ClearAPIKeyUsageCooldown(c *gin.Context) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
@@ -521,9 +522,11 @@ func (h *Handler) ClearAPIKeyUsageCooldown(c *gin.Context) {
 		if auth == nil || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		if h.canClearQuotaCooldownState(auth.ID) {
+		if h.canClearRecoverableAvailabilityState(auth.ID) {
 			_ = usagepersist.ClearAuthQuotaCooldowns(c.Request.Context(), auth.ID)
-			manager.ClearQuotaCooldownState(c.Request.Context(), auth.ID)
+			for _, model := range manager.ClearRecoverableAvailabilityState(c.Request.Context(), auth.ID) {
+				_ = usagepersist.ClearCooldown(c.Request.Context(), auth.ID, model)
+			}
 		}
 		if updated, ok := manager.GetByID(auth.ID); ok && updated != nil {
 			statuses = append(statuses, apiKeyUsageStatusFromAuth(updated, time.Now()))
