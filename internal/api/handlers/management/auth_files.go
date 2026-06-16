@@ -463,7 +463,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	auth.EnsureIndex()
 	runtimeOnly := isRuntimeOnlyAuth(auth)
-	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
+	if runtimeOnly && (auth.Archived || auth.Status == coreauth.StatusArchived || auth.Disabled || auth.Status == coreauth.StatusDisabled) {
 		return nil
 	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
@@ -485,6 +485,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"status":         status,
 		"status_message": statusMessage,
 		"disabled":       auth.Disabled,
+		"archived":       auth.Archived,
 		"unavailable":    unavailable,
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
@@ -531,7 +532,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["modtime"] = info.ModTime()
 		} else if os.IsNotExist(err) {
 			// Hide credentials removed from disk but still lingering in memory.
-			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
+			if !runtimeOnly && (auth.Archived || auth.Status == coreauth.StatusArchived || auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
 				return nil
 			}
 			entry["source"] = "memory"
@@ -590,6 +591,9 @@ func effectiveAuthFileStatus(auth *coreauth.Auth, now time.Time) (coreauth.Statu
 	statusCode := 0
 	if auth.LastError != nil {
 		statusCode = auth.LastError.HTTPStatus
+	}
+	if auth.Archived || status == coreauth.StatusArchived {
+		return coreauth.StatusArchived, statusMessage, unavailable, nextRetryAfter, statusCode
 	}
 	if auth.Disabled || status == coreauth.StatusDisabled {
 		return status, statusMessage, unavailable, nextRetryAfter, statusCode
@@ -1290,6 +1294,10 @@ func (h *Handler) RefreshAuthFile(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
+	if targetAuth.Archived || targetAuth.Status == coreauth.StatusArchived {
+		c.JSON(http.StatusConflict, gin.H{"error": "auth file is archived"})
+		return
+	}
 
 	updated, err := h.authManager.RefreshAuth(c.Request.Context(), targetAuth.ID)
 	if err != nil {
@@ -1324,6 +1332,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	var req struct {
 		Name     string `json:"name"`
 		Disabled *bool  `json:"disabled"`
+		Archived *bool  `json:"archived"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1335,8 +1344,8 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	if req.Disabled == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
+	if req.Disabled == nil && req.Archived == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled or archived is required"})
 		return
 	}
 
@@ -1348,17 +1357,34 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	// Update disabled state
-	targetAuth.Disabled = *req.Disabled
-	targetAuth.Unavailable = false
-	targetAuth.LastError = nil
-	targetAuth.NextRetryAfter = time.Time{}
-	if *req.Disabled {
-		targetAuth.Status = coreauth.StatusDisabled
-		targetAuth.StatusMessage = "disabled via management API"
-	} else {
-		targetAuth.Status = coreauth.StatusActive
-		targetAuth.StatusMessage = ""
+	if req.Disabled != nil {
+		targetAuth.Disabled = *req.Disabled
+		targetAuth.Unavailable = false
+		targetAuth.LastError = nil
+		targetAuth.NextRetryAfter = time.Time{}
+		if *req.Disabled {
+			targetAuth.Status = coreauth.StatusDisabled
+			targetAuth.StatusMessage = "disabled via management API"
+		} else if targetAuth.Archived {
+			targetAuth.Status = coreauth.StatusArchived
+			targetAuth.StatusMessage = ""
+		} else {
+			targetAuth.Status = coreauth.StatusActive
+			targetAuth.StatusMessage = ""
+		}
+	}
+	if req.Archived != nil {
+		targetAuth.Archived = *req.Archived
+		if *req.Archived {
+			targetAuth.Unavailable = false
+			targetAuth.NextRetryAfter = time.Time{}
+			targetAuth.NextRefreshAfter = time.Time{}
+			if !targetAuth.Disabled && targetAuth.Status != coreauth.StatusDisabled {
+				targetAuth.Status = coreauth.StatusArchived
+			}
+		} else if !targetAuth.Disabled && targetAuth.Status == coreauth.StatusArchived {
+			targetAuth.Status = coreauth.StatusActive
+		}
 	}
 	targetAuth.UpdatedAt = time.Now()
 
@@ -1367,7 +1393,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": targetAuth.Disabled, "archived": targetAuth.Archived})
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.
@@ -1593,6 +1619,9 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncAuthFileDisabledState(auth)
 	}
+	if _, ok := touchedRoots["archived"]; ok {
+		syncAuthFileArchivedState(auth)
+	}
 }
 
 func syncAuthFileHeaderAttributes(auth *coreauth.Auth) {
@@ -1715,8 +1744,33 @@ func syncAuthFileDisabledState(auth *coreauth.Auth) {
 		}
 		return
 	}
+	if auth.Archived {
+		auth.Status = coreauth.StatusArchived
+		auth.StatusMessage = ""
+		return
+	}
 	auth.Status = coreauth.StatusActive
 	auth.StatusMessage = ""
+}
+
+func syncAuthFileArchivedState(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	archived, ok := authFileBoolValue(auth.Metadata["archived"])
+	if !ok {
+		return
+	}
+	auth.Archived = archived
+	if archived {
+		if !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+			auth.Status = coreauth.StatusArchived
+		}
+		return
+	}
+	if !auth.Disabled && auth.Status == coreauth.StatusArchived {
+		auth.Status = coreauth.StatusActive
+	}
 }
 
 func (h *Handler) removeAuth(ctx context.Context, id string) {

@@ -65,6 +65,8 @@ type Auth struct {
 	StatusMessage string `json:"status_message,omitempty"`
 	// Disabled indicates the auth is intentionally disabled by operator.
 	Disabled bool `json:"disabled"`
+	// Archived indicates the credential has been manually sealed away from routing and refresh work.
+	Archived bool `json:"archived"`
 	// Unavailable flags transient provider unavailability (e.g. quota exceeded).
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.

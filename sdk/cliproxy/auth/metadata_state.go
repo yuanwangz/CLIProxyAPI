@@ -11,6 +11,7 @@ import (
 
 const (
 	metadataCredentialCreatedAtKey = "credential_created_at"
+	metadataArchivedKey            = "archived"
 	metadataDisabledKey            = "disabled"
 	metadataLastErrorKey           = "last_error"
 	metadataStatusMessageKey       = "status_message"
@@ -47,6 +48,7 @@ func SyncAuthStateToMetadata(auth *Auth) {
 	if !auth.CreatedAt.IsZero() {
 		auth.Metadata[metadataCredentialCreatedAtKey] = auth.CreatedAt.UTC().Format(time.RFC3339Nano)
 	}
+	auth.Metadata[metadataArchivedKey] = auth.Archived
 	auth.Metadata[metadataDisabledKey] = auth.Disabled
 	persistLastError := auth.Disabled || auth.Status == StatusDisabled
 	if persistLastError && auth.LastError != nil && auth.LastError.HTTPStatus == 401 {
@@ -78,6 +80,12 @@ func RestoreAuthStateFromMetadata(auth *Auth) {
 	}
 	if createdAt, ok := CredentialCreatedAtFromMetadata(auth.Metadata); ok {
 		auth.CreatedAt = createdAt
+	}
+	if archived, ok := metadataBool(auth.Metadata[metadataArchivedKey]); ok {
+		auth.Archived = archived
+		if archived && !auth.Disabled && auth.Status != StatusDisabled {
+			auth.Status = StatusArchived
+		}
 	}
 	if disabled, ok := metadataBool(auth.Metadata[metadataDisabledKey]); ok {
 		auth.Disabled = disabled

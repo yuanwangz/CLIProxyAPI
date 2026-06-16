@@ -21,6 +21,7 @@ type apiKeyUsageEntry struct {
 	StatusMessage  string                         `json:"status_message,omitempty"`
 	StatusCode     int                            `json:"status_code,omitempty"`
 	Disabled       bool                           `json:"disabled,omitempty"`
+	Archived       bool                           `json:"archived,omitempty"`
 	Unavailable    bool                           `json:"unavailable,omitempty"`
 	Blocked        bool                           `json:"blocked,omitempty"`
 	Cooling        bool                           `json:"cooling,omitempty"`
@@ -29,6 +30,7 @@ type apiKeyUsageEntry struct {
 	NextRetryMS    int64                          `json:"next_retry_after_ms,omitempty"`
 	TotalAuths     int                            `json:"total_auths,omitempty"`
 	DisabledCount  int                            `json:"disabled_count,omitempty"`
+	ArchivedCount  int                            `json:"archived_count,omitempty"`
 	BlockedCount   int                            `json:"blocked_count,omitempty"`
 	CoolingCount   int                            `json:"cooling_count,omitempty"`
 	ModelStates    []apiKeyUsageModelState        `json:"model_states,omitempty"`
@@ -72,6 +74,7 @@ type apiKeyUsageAuthStatus struct {
 	StatusMessage  string                  `json:"status_message,omitempty"`
 	StatusCode     int                     `json:"status_code,omitempty"`
 	Disabled       bool                    `json:"disabled,omitempty"`
+	Archived       bool                    `json:"archived,omitempty"`
 	Unavailable    bool                    `json:"unavailable,omitempty"`
 	Blocked        bool                    `json:"blocked,omitempty"`
 	Cooling        bool                    `json:"cooling,omitempty"`
@@ -247,7 +250,7 @@ func apiKeyUsageModelStatus(model string, state *coreauth.ModelState, now time.T
 		out.NextRetryAfter, out.NextRetryMS = formatAPIKeyUsageTime(next)
 	}
 	out.Quota = buildAPIKeyUsageQuotaState(state.Quota)
-	out.Blocked = state.Status == coreauth.StatusDisabled || (out.Unavailable && next.After(now))
+	out.Blocked = state.Status == coreauth.StatusDisabled || state.Status == coreauth.StatusArchived || (out.Unavailable && next.After(now))
 	out.Cooling = out.Blocked && apiKeyUsageIsQuotaCooldown(state.Quota, state.LastError, out.StatusMessage)
 	if out.Blocked {
 		out.BlockReason = apiKeyUsageBlockReason(state.Quota, state.LastError, out.StatusMessage)
@@ -273,6 +276,7 @@ func apiKeyUsageStatusFromAuth(auth *coreauth.Auth, now time.Time) apiKeyUsageAu
 		StatusMessage:  strings.TrimSpace(statusMessage),
 		StatusCode:     statusCode,
 		Disabled:       auth.Disabled || status == coreauth.StatusDisabled,
+		Archived:       auth.Archived || status == coreauth.StatusArchived,
 		Unavailable:    unavailable,
 		NextRetryAfter: nextRetry,
 		NextRetryMS:    nextRetryMS,
@@ -281,7 +285,7 @@ func apiKeyUsageStatusFromAuth(auth *coreauth.Auth, now time.Time) apiKeyUsageAu
 	if unavailable && nextRetryAfter.After(now) {
 		out.Blocked = true
 	}
-	if out.Disabled {
+	if out.Disabled || out.Archived {
 		out.Blocked = true
 	}
 	out.Cooling = out.Blocked && apiKeyUsageIsQuotaCooldown(auth.Quota, auth.LastError, out.StatusMessage)
@@ -340,6 +344,9 @@ func mergeAPIKeyUsageStatus(entry apiKeyUsageEntry, status apiKeyUsageAuthStatus
 	if status.Disabled {
 		entry.DisabledCount++
 	}
+	if status.Archived {
+		entry.ArchivedCount++
+	}
 	if status.Blocked {
 		entry.BlockedCount++
 	}
@@ -363,6 +370,7 @@ func mergeAPIKeyUsageStatus(entry apiKeyUsageEntry, status apiKeyUsageAuthStatus
 		entry.AuthIndex = status.AuthIndex
 	}
 	entry.Disabled = entry.TotalAuths > 0 && entry.DisabledCount == entry.TotalAuths
+	entry.Archived = entry.TotalAuths > 0 && entry.ArchivedCount == entry.TotalAuths
 	entry.Unavailable = entry.Unavailable || status.Unavailable
 	entry.Blocked = entry.Blocked || status.Blocked
 	entry.Cooling = entry.Cooling || status.Cooling

@@ -62,6 +62,31 @@ func TestNextRefreshCheckAt_DisabledUnschedule(t *testing.T) {
 	}
 }
 
+func TestNextRefreshCheckAt_ArchivedUnschedule(t *testing.T) {
+	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	expiry := now.Add(time.Hour)
+	lead := 10 * time.Minute
+	setRefreshLeadFactory(t, "archived-schedule", func() *time.Duration {
+		d := lead
+		return &d
+	})
+
+	auth := &Auth{
+		ID:       "a1",
+		Provider: "archived-schedule",
+		Archived: true,
+		Status:   StatusArchived,
+		Metadata: map[string]any{
+			"email":      "x@example.com",
+			"expires_at": expiry.Format(time.RFC3339),
+		},
+	}
+
+	if _, ok := nextRefreshCheckAt(now, auth, 15*time.Minute); ok {
+		t.Fatalf("nextRefreshCheckAt() ok = true, want false")
+	}
+}
+
 func TestNextRefreshCheckAt_APIKeyUnschedule(t *testing.T) {
 	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
 	auth := &Auth{ID: "a1", Provider: "test", Attributes: map[string]string{"api_key": "k"}}

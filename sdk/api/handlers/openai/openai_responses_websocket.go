@@ -1002,7 +1002,7 @@ func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName stri
 	if auth == nil {
 		return false
 	}
-	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+	if auth.Archived || auth.Status == coreauth.StatusArchived || auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		return false
 	}
 	if modelName != "" && len(auth.ModelStates) > 0 {

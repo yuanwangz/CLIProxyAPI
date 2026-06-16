@@ -482,6 +482,11 @@ func pluginAuthDataToCoreAuth(data pluginapi.AuthData, path, fileName string, au
 		UpdatedAt:        now,
 		NextRefreshAfter: data.NextRefreshAfter,
 	}
+	coreauth.RestoreAuthStateFromMetadata(auth)
+	if data.Disabled {
+		auth.Disabled = true
+		auth.Status = coreauth.StatusDisabled
+	}
 	return auth
 }
 

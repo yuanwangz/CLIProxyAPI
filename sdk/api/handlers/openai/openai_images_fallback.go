@@ -590,7 +590,7 @@ func (h *OpenAIAPIHandler) hasCodexOAuthImageFallbackAuth() bool {
 		return false
 	}
 	for _, auth := range h.AuthManager.List() {
-		if auth == nil || auth.Disabled {
+		if auth == nil || auth.Archived || auth.Status == coreauth.StatusArchived || auth.Disabled {
 			continue
 		}
 		if imagesfallback.IsCodexOAuthAuth(auth) {

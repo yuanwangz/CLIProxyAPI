@@ -138,9 +138,12 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 
 	disabled, _ := metadata["disabled"].(bool)
+	archived, _ := metadata["archived"].(bool)
 	status := coreauth.StatusActive
 	if disabled {
 		status = coreauth.StatusDisabled
+	} else if archived {
+		status = coreauth.StatusArchived
 	}
 
 	// Read per-account excluded models from the OAuth JSON file.
@@ -153,6 +156,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		Prefix:   prefix,
 		Status:   status,
 		Disabled: disabled,
+		Archived: archived,
 		Attributes: map[string]string{
 			"source": fullPath,
 			"path":   fullPath,

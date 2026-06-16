@@ -546,7 +546,7 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 	}
 	authID := strings.TrimSpace(auth.ID)
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if authID == "" || providerKey == "" || auth.Disabled {
+	if authID == "" || providerKey == "" || auth.Disabled || auth.Archived || auth.Status == StatusArchived {
 		s.removeAuthLocked(authID)
 		return
 	}

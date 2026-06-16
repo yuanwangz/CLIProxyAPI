@@ -137,6 +137,61 @@ func TestFileTokenStore_SaveAndList_PreservesDisabledUnauthorizedStatus(t *testi
 	}
 }
 
+func TestFileTokenStore_SaveAndList_PreservesArchivedFlag(t *testing.T) {
+	ctx := context.Background()
+	baseDir := t.TempDir()
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	authPath := filepath.Join(baseDir, "archived.json")
+	if err := os.WriteFile(authPath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("seed auth file: %v", err)
+	}
+
+	auth := &cliproxyauth.Auth{
+		ID:       "archived.json",
+		Provider: "codex",
+		FileName: "archived.json",
+		Archived: true,
+		Status:   cliproxyauth.StatusArchived,
+		Metadata: map[string]any{"type": "codex"},
+	}
+
+	savedPath, err := store.Save(ctx, auth)
+	if err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	raw, err := os.ReadFile(savedPath)
+	if err != nil {
+		t.Fatalf("read auth file: %v", err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatalf("unmarshal auth file: %v", err)
+	}
+	if archived, _ := meta["archived"].(bool); !archived {
+		t.Fatalf("archived=%v, want true (raw=%s)", meta["archived"], string(raw))
+	}
+
+	listed, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("List() len=%d, want 1", len(listed))
+	}
+	got := listed[0]
+	if !got.Archived {
+		t.Fatal("listed Archived=false, want true")
+	}
+	if got.Disabled {
+		t.Fatal("listed Disabled=true, want false")
+	}
+	if got.Status != cliproxyauth.StatusArchived {
+		t.Fatalf("listed Status=%q, want %q", got.Status, cliproxyauth.StatusArchived)
+	}
+}
+
 func TestFileTokenStore_SaveAndList_PreservesCredentialCreatedAtMetadata(t *testing.T) {
 	ctx := context.Background()
 	baseDir := t.TempDir()

@@ -136,7 +136,7 @@ func main() {
 	// Find the first enabled antigravity auth.
 	var chosen *coreauth.Auth
 	for _, a := range auths {
-		if a == nil || a.Disabled {
+		if a == nil || a.Archived || a.Status == coreauth.StatusArchived || a.Disabled {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(a.Provider), "antigravity") {

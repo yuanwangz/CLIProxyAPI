@@ -199,7 +199,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("postgres store: missing file path attribute for %s", auth.ID)
 	}
 
-	if auth.Disabled {
+	if auth.Disabled || auth.Archived {
 		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		}
@@ -316,6 +316,10 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			NextRefreshAfter: time.Time{},
 		}
 		cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+		if archived, ok := metadata["archived"].(bool); ok && archived {
+			auth.Archived = true
+			auth.Status = cliproxyauth.StatusArchived
+		}
 		if disabled, ok := metadata["disabled"].(bool); ok && disabled {
 			auth.Disabled = true
 			auth.Status = cliproxyauth.StatusDisabled

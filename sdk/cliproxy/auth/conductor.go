@@ -417,7 +417,7 @@ func (m *Manager) ClearQuotaCooldownState(ctx context.Context, authID string) {
 
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
-	if ok && auth != nil && !auth.Disabled && auth.Status != StatusDisabled {
+	if ok && auth != nil && !auth.Archived && auth.Status != StatusArchived && !auth.Disabled && auth.Status != StatusDisabled {
 		changed := false
 
 		if authHasQuotaCooldown(auth) {
@@ -498,7 +498,7 @@ func (m *Manager) ClearRecoverableAvailabilityState(ctx context.Context, authID 
 
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
-	if ok && auth != nil && !auth.Disabled && auth.Status != StatusDisabled {
+	if ok && auth != nil && !auth.Archived && auth.Status != StatusArchived && !auth.Disabled && auth.Status != StatusDisabled {
 		changed := false
 
 		if authHasRecoverableAvailabilityBlock(auth) {
@@ -1603,7 +1603,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.CreatedAt.IsZero() {
 		auth.CreatedAt = existing.CreatedAt
 	}
-	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+	if !existing.Archived && existing.Status != StatusArchived && !existing.Disabled && existing.Status != StatusDisabled && !auth.Archived && auth.Status != StatusArchived && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
@@ -3126,7 +3126,7 @@ func modelStateHasQuotaCooldown(state *ModelState) bool {
 }
 
 func authHasRecoverableAvailabilityBlock(auth *Auth) bool {
-	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+	if auth == nil || auth.Archived || auth.Status == StatusArchived || auth.Disabled || auth.Status == StatusDisabled {
 		return false
 	}
 	if errorIsUnauthorized(auth.LastError) {
@@ -3341,7 +3341,7 @@ func applyUnauthorizedDisabledState(auth *Auth, resultErr *Error, now time.Time)
 }
 
 func shouldEnableAfterUnauthorizedRefresh(auth *Auth) bool {
-	if auth == nil || (!auth.Disabled && auth.Status != StatusDisabled) {
+	if auth == nil || auth.Archived || auth.Status == StatusArchived || (!auth.Disabled && auth.Status != StatusDisabled) {
 		return false
 	}
 	return hasUnauthorizedAuthFailure(auth) || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "unauthorized")
@@ -3860,7 +3860,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
-		if candidate.Provider != provider || candidate.Disabled {
+		if candidate.Provider != provider || candidate.Archived || candidate.Status == StatusArchived || candidate.Disabled {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -3926,7 +3926,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if strings.TrimSpace(model) != "" {
 		m.mu.RLock()
 		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Provider != provider || candidate.Disabled {
+			if candidate == nil || candidate.Provider != provider || candidate.Archived || candidate.Status == StatusArchived || candidate.Disabled {
 				continue
 			}
 			if _, used := tried[candidate.ID]; used {
@@ -4010,7 +4010,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
-		if candidate == nil || candidate.Disabled {
+		if candidate == nil || candidate.Archived || candidate.Status == StatusArchived || candidate.Disabled {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -4114,7 +4114,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		m.mu.RLock()
 		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Disabled {
+			if candidate == nil || candidate.Archived || candidate.Status == StatusArchived || candidate.Disabled {
 				continue
 			}
 			if _, ok := providerSet[strings.TrimSpace(strings.ToLower(candidate.Provider))]; !ok {
@@ -4555,7 +4555,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 	var known []creditsCandidateEntry
 	var unknown []creditsCandidateEntry
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.Archived || auth.Status == StatusArchived || auth.Disabled || auth.Status == StatusDisabled {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
@@ -4827,6 +4827,9 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
 		return false
 	}
+	if a.Archived || a.Status == StatusArchived {
+		return false
+	}
 	if hasUnauthorizedAuthFailure(a) {
 		return false
 	}
@@ -5070,6 +5073,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) (*Auth, error) {
 	m.mu.RUnlock()
 	if auth == nil {
 		return nil, errors.New("auth not found")
+	}
+	if cloned != nil && (cloned.Archived || cloned.Status == StatusArchived) {
+		return cloned, errors.New("auth is archived")
 	}
 	if exec == nil {
 		return nil, errors.New("auth executor not found")

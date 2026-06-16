@@ -16,4 +16,6 @@ const (
 	StatusError Status = "error"
 	// StatusDisabled marks the auth as intentionally disabled.
 	StatusDisabled Status = "disabled"
+	// StatusArchived marks the auth as hidden from normal routing and refresh work.
+	StatusArchived Status = "archived"
 )

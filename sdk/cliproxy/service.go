@@ -395,7 +395,7 @@ func (s *Service) registerModelRefreshCallback() {
 				continue
 			}
 			auth, ok := s.coreManager.GetByID(item.ID)
-			if !ok || auth == nil || auth.Disabled {
+			if !ok || auth == nil || auth.Archived || auth.Status == coreauth.StatusArchived || auth.Disabled {
 				continue
 			}
 			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
@@ -687,7 +687,7 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		if auth.CreatedAt.IsZero() {
 			auth.CreatedAt = existing.CreatedAt
 		}
-		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+		if !existing.Archived && existing.Status != coreauth.StatusArchived && !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Archived && auth.Status != coreauth.StatusArchived && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			auth.NextRefreshAfter = existing.NextRefreshAfter
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
@@ -702,7 +702,7 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 	if err != nil {
 		log.Errorf("failed to %s auth %s: %v", op, auth.ID, err)
 		current, ok := s.coreManager.GetByID(auth.ID)
-		if !ok || current.Disabled {
+		if !ok || current.Disabled || current.Archived || current.Status == coreauth.StatusArchived {
 			GlobalModelRegistry().UnregisterClient(auth.ID)
 			return nil
 		}
@@ -919,7 +919,7 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	// Skip disabled auth entries when (re)binding executors.
 	// Disabled auths can linger during config reloads (e.g., removed OpenAI-compat entries)
 	// and must not override active provider executors.
-	if a.Disabled {
+	if a.Disabled || a.Archived || a.Status == coreauth.StatusArchived {
 		return
 	}
 	if compatProviderKey, _, isCompat := openAICompatInfoFromAuth(a); isCompat {
@@ -1712,7 +1712,7 @@ func (s *Service) registerModelsForAuth(ctx context.Context, a *coreauth.Auth) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a.Disabled {
+	if a.Archived || a.Status == coreauth.StatusArchived || a.Disabled {
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
 	}
@@ -1935,7 +1935,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	}
 
 	ctx := context.Background()
-	if !current.Disabled {
+	if !current.Archived && current.Status != coreauth.StatusArchived && !current.Disabled {
 		s.ensureExecutorsForAuth(current)
 	}
 	s.registerModelsForAuth(ctx, current)
@@ -1943,7 +1943,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	s.coreManager.RestorePersistedCooldowns(ctx, current.ID)
 
 	latest, ok := s.latestAuthForModelRegistration(current.ID)
-	if !ok || latest.Disabled {
+	if !ok || latest.Archived || latest.Status == coreauth.StatusArchived || latest.Disabled {
 		GlobalModelRegistry().UnregisterClient(current.ID)
 		s.coreManager.RefreshSchedulerEntry(current.ID)
 		return false

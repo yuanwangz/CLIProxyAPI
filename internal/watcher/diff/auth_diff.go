@@ -9,9 +9,9 @@ import (
 )
 
 // BuildAuthChangeDetails computes a redacted, human-readable list of auth field changes.
-// Only prefix, proxy_url, and disabled fields are tracked; sensitive data is never printed.
+// Only prefix, proxy_url, disabled, and archived fields are tracked; sensitive data is never printed.
 func BuildAuthChangeDetails(oldAuth, newAuth *coreauth.Auth) []string {
-	changes := make([]string, 0, 3)
+	changes := make([]string, 0, 4)
 
 	// Handle nil cases by using empty Auth as default
 	if oldAuth == nil {
@@ -38,6 +38,10 @@ func BuildAuthChangeDetails(oldAuth, newAuth *coreauth.Auth) []string {
 	// Compare disabled
 	if oldAuth.Disabled != newAuth.Disabled {
 		changes = append(changes, fmt.Sprintf("disabled: %t -> %t", oldAuth.Disabled, newAuth.Disabled))
+	}
+
+	if oldAuth.Archived != newAuth.Archived {
+		changes = append(changes, fmt.Sprintf("archived: %t -> %t", oldAuth.Archived, newAuth.Archived))
 	}
 
 	return changes

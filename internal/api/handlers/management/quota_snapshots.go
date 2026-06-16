@@ -135,7 +135,7 @@ func (h *Handler) canClearRecoverableAvailabilityState(authID string) bool {
 	if !ok || auth == nil {
 		return true
 	}
-	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+	if auth.Archived || auth.Status == coreauth.StatusArchived || auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		return false
 	}
 	return auth.LastError == nil || auth.LastError.StatusCode() != http.StatusUnauthorized

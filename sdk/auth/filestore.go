@@ -82,7 +82,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: missing file path attribute for %s", auth.ID)
 	}
 
-	if auth.Disabled {
+	if auth.Disabled || auth.Archived {
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 			return "", nil
 		}
@@ -288,9 +288,12 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	}
 	id := s.idFor(path, baseDir)
 	disabled, _ := metadata["disabled"].(bool)
+	archived, _ := metadata["archived"].(bool)
 	status := cliproxyauth.StatusActive
 	if disabled {
 		status = cliproxyauth.StatusDisabled
+	} else if archived {
+		status = cliproxyauth.StatusArchived
 	}
 	auth := &cliproxyauth.Auth{
 		ID:               id,
@@ -299,6 +302,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		Label:            s.labelFor(metadata),
 		Status:           status,
 		Disabled:         disabled,
+		Archived:         archived,
 		Attributes:       map[string]string{"path": path},
 		Metadata:         metadata,
 		CreatedAt:        cliproxyauth.CredentialCreatedAt(metadata, info, info.ModTime()),

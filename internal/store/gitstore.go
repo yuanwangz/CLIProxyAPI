@@ -268,7 +268,7 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		return "", fmt.Errorf("auth filestore: missing file path attribute for %s", auth.ID)
 	}
 
-	if auth.Disabled {
+	if auth.Disabled || auth.Archived {
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 			return "", nil
 		}
@@ -494,6 +494,10 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		auth.Attributes["email"] = email
 	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+	if archived, ok := metadata["archived"].(bool); ok && archived {
+		auth.Archived = true
+		auth.Status = cliproxyauth.StatusArchived
+	}
 	if disabled, ok := metadata["disabled"].(bool); ok && disabled {
 		auth.Disabled = true
 		auth.Status = cliproxyauth.StatusDisabled
