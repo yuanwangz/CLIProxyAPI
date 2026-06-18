@@ -95,6 +95,14 @@ func TestBuildEventUsesFailureStatusCodeForProviderAttempt(t *testing.T) {
 	if event.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status code = %d, want %d", event.StatusCode, http.StatusTooManyRequests)
 	}
+	if event.Error != "usage limit reached" {
+		t.Fatalf("error = %q, want failure body", event.Error)
+	}
+	payload := BuildPayload([]Event{event})
+	details := payload.APIs["POST /v1/responses"].Models["gpt-5.5"].Details
+	if len(details) != 1 || details[0].Error != "usage limit reached" {
+		t.Fatalf("payload error details = %+v, want failure body", details)
+	}
 }
 
 func TestBuildEventPrefersFailureStatusCodeOverResponseOK(t *testing.T) {
@@ -167,6 +175,7 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 			TotalTokens:  4,
 			Failed:       true,
 			StatusCode:   http.StatusTooManyRequests,
+			Error:        `{"error":{"message":"rate limit reached"}}`,
 		},
 	})
 	if err != nil {
@@ -213,7 +222,7 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 		t.Fatalf("payload api entry = %+v", apiEntry)
 	}
 	detail := apiEntry.Models["gpt-5"].Details[0]
-	if detail.SourceFull != "local-full" || detail.APIKey != "clie...3456" || detail.APIKeyHash != "client-key-hash" || detail.StatusCode != http.StatusTooManyRequests {
+	if detail.SourceFull != "local-full" || detail.APIKey != "clie...3456" || detail.APIKeyHash != "client-key-hash" || detail.StatusCode != http.StatusTooManyRequests || detail.Error != `{"error":{"message":"rate limit reached"}}` {
 		t.Fatalf("payload detail did not preserve extended fields: %+v", detail)
 	}
 

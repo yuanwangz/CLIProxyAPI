@@ -32,6 +32,7 @@ const (
 	quotaSnapshotQueueSize         = 1024
 	apiKeyUsageBucketSeconds int64 = 10 * 60
 	apiKeyUsageBucketCount         = 20
+	maxFailureBodyBytes            = 16 * 1024
 )
 
 type Store struct {
@@ -83,6 +84,7 @@ type Event struct {
 	LatencyMS       *int64 `json:"latency_ms,omitempty"`
 	Failed          bool   `json:"failed"`
 	StatusCode      int    `json:"status_code,omitempty"`
+	Error           string `json:"error,omitempty"`
 	RawJSON         string `json:"raw_json,omitempty"`
 	CreatedAtMS     int64  `json:"created_at_ms"`
 }
@@ -108,6 +110,7 @@ type Detail struct {
 	AuthIndex  string `json:"auth_index,omitempty"`
 	LatencyMS  *int64 `json:"latency_ms,omitempty"`
 	StatusCode int    `json:"status_code,omitempty"`
+	Error      string `json:"error,omitempty"`
 	Tokens     Tokens `json:"tokens"`
 	Failed     bool   `json:"failed"`
 }
@@ -588,6 +591,7 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 		LatencyMS:       latencyPtr,
 		Failed:          failed,
 		StatusCode:      statusCode,
+		Error:           failureBody(record.Fail.Body, failed),
 		CreatedAtMS:     time.Now().UnixMilli(),
 	}
 	event.RawJSON = rawEventJSON(event, record.Alias)
@@ -749,6 +753,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 			event.LatencyMS = &value
 		}
 		event.Failed = failed != 0
+		event.Error = failureBodyFromRawJSON(event.RawJSON)
 		events = append(events, event)
 	}
 	return events, rows.Err()
@@ -1513,6 +1518,10 @@ func BuildPayload(events []Event) Payload {
 			modelEntry = &ModelAggregate{}
 			apiEntry.Models[model] = modelEntry
 		}
+		errorDetail := event.Error
+		if strings.TrimSpace(errorDetail) == "" {
+			errorDetail = failureBodyFromRawJSON(event.RawJSON)
+		}
 		modelEntry.Details = append(modelEntry.Details, Detail{
 			Timestamp:  event.Timestamp,
 			Source:     event.Source,
@@ -1523,6 +1532,7 @@ func BuildPayload(events []Event) Payload {
 			AuthIndex:  event.AuthIndex,
 			LatencyMS:  event.LatencyMS,
 			StatusCode: event.StatusCode,
+			Error:      errorDetail,
 			Failed:     event.Failed,
 			Tokens: Tokens{
 				InputTokens:     event.InputTokens,
@@ -1729,6 +1739,13 @@ func normalizeEvent(event Event) Event {
 	if event.StatusCode < 0 {
 		event.StatusCode = 0
 	}
+	event.Error = failureBody(event.Error, event.Failed)
+	if event.Error == "" && event.RawJSON != "" {
+		event.Error = failureBodyFromRawJSON(event.RawJSON)
+	}
+	if event.RawJSON == "" {
+		event.RawJSON = rawEventJSON(event, "")
+	}
 	if event.EventHash == "" {
 		event.EventHash = buildEventHash(event)
 	}
@@ -1844,8 +1861,66 @@ func rawEventJSON(event Event, alias string) string {
 		"failed":           event.Failed,
 		"status_code":      event.StatusCode,
 	}
+	if strings.TrimSpace(event.Error) != "" {
+		payload["error"] = event.Error
+	}
 	data, _ := json.Marshal(payload)
 	return string(data)
+}
+
+func failureBody(body string, failed bool) string {
+	body = strings.TrimSpace(body)
+	if body == "" || !failed {
+		return ""
+	}
+	if len(body) <= maxFailureBodyBytes {
+		return body
+	}
+	return body[:maxFailureBodyBytes] + "\n...[truncated]"
+}
+
+func failureBodyFromRawJSON(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+	for _, key := range []string{"error", "error_detail", "failure_body"} {
+		if value := rawTextField(payload[key]); value != "" {
+			return failureBody(value, true)
+		}
+	}
+	if failRaw := payload["fail"]; len(failRaw) > 0 {
+		var failPayload map[string]json.RawMessage
+		if err := json.Unmarshal(failRaw, &failPayload); err == nil {
+			if value := rawTextField(failPayload["body"]); value != "" {
+				return failureBody(value, true)
+			}
+		}
+	}
+	return ""
+}
+
+func rawTextField(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return strings.TrimSpace(text)
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func buildEventHash(event Event) string {

@@ -53,6 +53,7 @@ Go 1.26+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with 
 - Auth file list responses expose `created_at` as the credential creation time sourced from `credential_created_at`; the management UI should display it without adding wide table columns that break dense credential lists.
 - Auth file list responses expose `archived` and `status: "archived"` for sealed credentials. The management UI defaults to showing unarchived credentials, provides archived/all filters, and uses `PATCH /v0/management/auth-files/status` with `{ name, archived }` for manual archive/unarchive actions.
 - Quota page availability filters may use a successful stored/refreshed quota snapshot to override stale quota-limited auth-file state, but disabled and 401 unauthorized credentials must remain unavailable until re-enabled or reauthorized.
+- Usage detail rows from `/v0/management/usage` may include `error` with the captured upstream failure response body/message, truncated by the backend to keep persisted events bounded. The management usage page renders failed rows as a clickable error label with a detail popover; old events without captured failure bodies should keep a graceful fallback.
 - The frontend release workflow is tag-driven: pushing a `v*` tag builds and publishes `dist/management.html`. If the user asks for a same-version frontend release, do not change `package.json` version; update the release/tag flow deliberately and verify the workflow result.
 
 ## Commands
