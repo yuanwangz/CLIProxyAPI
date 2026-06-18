@@ -147,12 +147,13 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	type geminiKeyPatch struct {
-		APIKey         *string            `json:"api-key"`
-		Prefix         *string            `json:"prefix"`
-		BaseURL        *string            `json:"base-url"`
-		ProxyURL       *string            `json:"proxy-url"`
-		Headers        *map[string]string `json:"headers"`
-		ExcludedModels *[]string          `json:"excluded-models"`
+		APIKey         *string                     `json:"api-key"`
+		Prefix         *string                     `json:"prefix"`
+		BaseURL        *string                     `json:"base-url"`
+		ProxyURL       *string                     `json:"proxy-url"`
+		Headers        *map[string]string          `json:"headers"`
+		ExcludedModels *[]string                   `json:"excluded-models"`
+		FailureWarmup  *config.FailureWarmupConfig `json:"failure-warmup"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -211,6 +212,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.FailureWarmup != nil {
+		entry.FailureWarmup = config.NormalizeFailureWarmupConfig(body.Value.FailureWarmup)
 	}
 	h.cfg.GeminiKey[targetIndex] = entry
 	h.cfg.SanitizeGeminiKeys()
@@ -307,13 +311,14 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 }
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	type claudeKeyPatch struct {
-		APIKey         *string               `json:"api-key"`
-		Prefix         *string               `json:"prefix"`
-		BaseURL        *string               `json:"base-url"`
-		ProxyURL       *string               `json:"proxy-url"`
-		Models         *[]config.ClaudeModel `json:"models"`
-		Headers        *map[string]string    `json:"headers"`
-		ExcludedModels *[]string             `json:"excluded-models"`
+		APIKey         *string                     `json:"api-key"`
+		Prefix         *string                     `json:"prefix"`
+		BaseURL        *string                     `json:"base-url"`
+		ProxyURL       *string                     `json:"proxy-url"`
+		Models         *[]config.ClaudeModel       `json:"models"`
+		Headers        *map[string]string          `json:"headers"`
+		ExcludedModels *[]string                   `json:"excluded-models"`
+		FailureWarmup  *config.FailureWarmupConfig `json:"failure-warmup"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -366,6 +371,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.FailureWarmup != nil {
+		entry.FailureWarmup = config.NormalizeFailureWarmupConfig(body.Value.FailureWarmup)
 	}
 	normalizeClaudeKey(&entry)
 	h.cfg.ClaudeKey[targetIndex] = entry
@@ -469,6 +477,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
 		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
 		Headers       *map[string]string                  `json:"headers"`
+		FailureWarmup *config.FailureWarmupConfig         `json:"failure-warmup"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -528,6 +537,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+	}
+	if body.Value.FailureWarmup != nil {
+		entry.FailureWarmup = config.NormalizeFailureWarmupConfig(body.Value.FailureWarmup)
 	}
 	normalizeOpenAICompatibilityEntry(&entry)
 	h.cfg.OpenAICompatibility[targetIndex] = entry
@@ -606,6 +618,7 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		Headers        *map[string]string          `json:"headers"`
 		Models         *[]config.VertexCompatModel `json:"models"`
 		ExcludedModels *[]string                   `json:"excluded-models"`
+		FailureWarmup  *config.FailureWarmupConfig `json:"failure-warmup"`
 	}
 	var body struct {
 		Index *int               `json:"index"`
@@ -674,6 +687,9 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.FailureWarmup != nil {
+		entry.FailureWarmup = config.NormalizeFailureWarmupConfig(body.Value.FailureWarmup)
 	}
 	normalizeVertexCompatKey(&entry)
 	h.cfg.VertexCompatAPIKey[targetIndex] = entry
@@ -955,13 +971,14 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 }
 func (h *Handler) PatchCodexKey(c *gin.Context) {
 	type codexKeyPatch struct {
-		APIKey         *string              `json:"api-key"`
-		Prefix         *string              `json:"prefix"`
-		BaseURL        *string              `json:"base-url"`
-		ProxyURL       *string              `json:"proxy-url"`
-		Models         *[]config.CodexModel `json:"models"`
-		Headers        *map[string]string   `json:"headers"`
-		ExcludedModels *[]string            `json:"excluded-models"`
+		APIKey         *string                     `json:"api-key"`
+		Prefix         *string                     `json:"prefix"`
+		BaseURL        *string                     `json:"base-url"`
+		ProxyURL       *string                     `json:"proxy-url"`
+		Models         *[]config.CodexModel        `json:"models"`
+		Headers        *map[string]string          `json:"headers"`
+		ExcludedModels *[]string                   `json:"excluded-models"`
+		FailureWarmup  *config.FailureWarmupConfig `json:"failure-warmup"`
 	}
 	var body struct {
 		Index *int           `json:"index"`
@@ -1021,6 +1038,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.FailureWarmup != nil {
+		entry.FailureWarmup = config.NormalizeFailureWarmupConfig(body.Value.FailureWarmup)
 	}
 	normalizeCodexKey(&entry)
 	h.cfg.CodexKey[targetIndex] = entry
@@ -1088,6 +1108,7 @@ func normalizeOpenAICompatibilityEntry(entry *config.OpenAICompatibility) {
 	// Trim base-url; empty base-url indicates provider should be removed by sanitization
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
+	entry.FailureWarmup = config.NormalizeFailureWarmupConfig(entry.FailureWarmup)
 	existing := make(map[string]struct{}, len(entry.APIKeyEntries))
 	for i := range entry.APIKeyEntries {
 		trimmed := strings.TrimSpace(entry.APIKeyEntries[i].APIKey)
@@ -1123,6 +1144,7 @@ func normalizeClaudeKey(entry *config.ClaudeKey) {
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
+	entry.FailureWarmup = config.NormalizeFailureWarmupConfig(entry.FailureWarmup)
 	if len(entry.Models) == 0 {
 		return
 	}
@@ -1149,6 +1171,7 @@ func normalizeCodexKey(entry *config.CodexKey) {
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
+	entry.FailureWarmup = config.NormalizeFailureWarmupConfig(entry.FailureWarmup)
 	if len(entry.Models) == 0 {
 		return
 	}
@@ -1175,6 +1198,7 @@ func normalizeVertexCompatKey(entry *config.VertexCompatKey) {
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
+	entry.FailureWarmup = config.NormalizeFailureWarmupConfig(entry.FailureWarmup)
 	if len(entry.Models) == 0 {
 		return
 	}

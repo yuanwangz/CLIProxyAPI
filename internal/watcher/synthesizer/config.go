@@ -74,6 +74,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(entry.Headers, attrs)
+		addFailureWarmupToAttrs(entry.FailureWarmup, attrs)
 		a := &coreauth.Auth{
 			ID:         id,
 			Provider:   "gemini",
@@ -129,6 +130,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(ck.Headers, attrs)
+		addFailureWarmupToAttrs(ck.FailureWarmup, attrs)
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
 			ID:         id,
@@ -187,6 +189,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(ck.Headers, attrs)
+		addFailureWarmupToAttrs(ck.FailureWarmup, attrs)
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
 			ID:         id,
@@ -257,6 +260,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				attrs["models_hash"] = hash
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
+			addFailureWarmupToAttrs(compat.FailureWarmup, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
 				Provider:   providerName,
@@ -296,6 +300,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				attrs["models_hash"] = hash
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
+			addFailureWarmupToAttrs(compat.FailureWarmup, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
 				Provider:   providerName,
@@ -348,6 +353,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(compat.Headers, attrs)
+		addFailureWarmupToAttrs(compat.FailureWarmup, attrs)
 		a := &coreauth.Auth{
 			ID:         id,
 			Provider:   providerName,

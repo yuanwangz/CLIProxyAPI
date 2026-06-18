@@ -169,6 +169,44 @@ func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_FailureWarmupAttributes(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			GeminiKey: []config.GeminiKey{
+				{
+					APIKey: "api-key",
+					FailureWarmup: &config.FailureWarmupConfig{
+						Enabled:     true,
+						StatusCodes: []int{429, 500, 429, 99},
+						MaxAttempts: 7,
+					},
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("synthesize: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	attrs := auths[0].Attributes
+	if attrs[coreauth.FailureWarmupEnabledAttribute] != "true" {
+		t.Fatalf("failure warmup enabled attr = %q, want true", attrs[coreauth.FailureWarmupEnabledAttribute])
+	}
+	if attrs[coreauth.FailureWarmupStatusCodesAttribute] != "429,500" {
+		t.Fatalf("failure warmup status attr = %q, want 429,500", attrs[coreauth.FailureWarmupStatusCodesAttribute])
+	}
+	if attrs[coreauth.FailureWarmupMaxAttemptsAttribute] != "7" {
+		t.Fatalf("failure warmup attempts attr = %q, want 7", attrs[coreauth.FailureWarmupMaxAttemptsAttribute])
+	}
+}
+
 func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{

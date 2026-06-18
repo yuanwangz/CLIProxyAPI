@@ -118,3 +118,20 @@ func addConfigHeadersToAttrs(headers map[string]string, attrs map[string]string)
 		attrs["header:"+key] = val
 	}
 }
+
+func addFailureWarmupToAttrs(warmup *config.FailureWarmupConfig, attrs map[string]string) {
+	if attrs == nil {
+		return
+	}
+	normalized := config.NormalizeFailureWarmupConfig(warmup)
+	if normalized == nil {
+		return
+	}
+	codes := make([]string, 0, len(normalized.StatusCodes))
+	for _, code := range normalized.StatusCodes {
+		codes = append(codes, fmt.Sprintf("%d", code))
+	}
+	attrs[coreauth.FailureWarmupEnabledAttribute] = "true"
+	attrs[coreauth.FailureWarmupStatusCodesAttribute] = strings.Join(codes, ",")
+	attrs[coreauth.FailureWarmupMaxAttemptsAttribute] = fmt.Sprintf("%d", normalized.MaxAttempts)
+}

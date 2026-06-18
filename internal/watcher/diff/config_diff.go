@@ -134,6 +134,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if !equalStringMap(o.Headers, n.Headers) {
 				changes = append(changes, fmt.Sprintf("gemini[%d].headers: updated", i))
 			}
+			if !reflect.DeepEqual(o.FailureWarmup, n.FailureWarmup) {
+				changes = append(changes, fmt.Sprintf("gemini[%d].failure-warmup: updated", i))
+			}
 			oldModels := SummarizeGeminiModels(o.Models)
 			newModels := SummarizeGeminiModels(n.Models)
 			if oldModels.hash != newModels.hash {
@@ -168,6 +171,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if !equalStringMap(o.Headers, n.Headers) {
 				changes = append(changes, fmt.Sprintf("claude[%d].headers: updated", i))
+			}
+			if !reflect.DeepEqual(o.FailureWarmup, n.FailureWarmup) {
+				changes = append(changes, fmt.Sprintf("claude[%d].failure-warmup: updated", i))
 			}
 			oldModels := SummarizeClaudeModels(o.Models)
 			newModels := SummarizeClaudeModels(n.Models)
@@ -217,6 +223,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if !equalStringMap(o.Headers, n.Headers) {
 				changes = append(changes, fmt.Sprintf("codex[%d].headers: updated", i))
+			}
+			if !reflect.DeepEqual(o.FailureWarmup, n.FailureWarmup) {
+				changes = append(changes, fmt.Sprintf("codex[%d].failure-warmup: updated", i))
 			}
 			oldModels := SummarizeCodexModels(o.Models)
 			newModels := SummarizeCodexModels(n.Models)
@@ -303,6 +312,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if !equalStringMap(o.Headers, n.Headers) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].headers: updated", i))
+			}
+			if !reflect.DeepEqual(o.FailureWarmup, n.FailureWarmup) {
+				changes = append(changes, fmt.Sprintf("vertex[%d].failure-warmup: updated", i))
 			}
 		}
 	}

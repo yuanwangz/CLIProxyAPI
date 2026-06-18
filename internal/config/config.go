@@ -318,6 +318,59 @@ type QuotaExceeded struct {
 	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
 }
 
+const DefaultFailureWarmupMaxAttempts = 5
+
+var DefaultFailureWarmupStatusCodes = []int{429, 500, 502, 503, 504, 529}
+
+// FailureWarmupConfig controls asynchronous retry warming after a provider failure.
+type FailureWarmupConfig struct {
+	// Enabled starts background warmup retries for matching upstream status codes.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// StatusCodes lists upstream HTTP status codes that should trigger a warmup retry.
+	StatusCodes []int `yaml:"status-codes,omitempty" json:"status-codes,omitempty"`
+	// MaxAttempts limits the number of background retry attempts per trigger.
+	MaxAttempts int `yaml:"max-attempts,omitempty" json:"max-attempts,omitempty"`
+}
+
+// NormalizeFailureWarmupConfig applies defaults and drops disabled/invalid configs.
+func NormalizeFailureWarmupConfig(cfg *FailureWarmupConfig) *FailureWarmupConfig {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	out := *cfg
+	out.StatusCodes = NormalizeFailureWarmupStatusCodes(out.StatusCodes)
+	if len(out.StatusCodes) == 0 {
+		out.StatusCodes = append([]int(nil), DefaultFailureWarmupStatusCodes...)
+	}
+	if out.MaxAttempts <= 0 {
+		out.MaxAttempts = DefaultFailureWarmupMaxAttempts
+	}
+	return &out
+}
+
+// NormalizeFailureWarmupStatusCodes keeps valid status codes in first-seen order.
+func NormalizeFailureWarmupStatusCodes(codes []int) []int {
+	if len(codes) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(codes))
+	out := make([]int, 0, len(codes))
+	for _, code := range codes {
+		if code < 100 || code > 599 {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
@@ -452,6 +505,9 @@ type ClaudeKey struct {
 	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 
+	// FailureWarmup asynchronously retries this credential after selected failure statuses.
+	FailureWarmup *FailureWarmupConfig `yaml:"failure-warmup,omitempty" json:"failure-warmup,omitempty"`
+
 	// Cloak configures request cloaking for non-Claude-Code clients.
 	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
 
@@ -510,6 +566,9 @@ type CodexKey struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// FailureWarmup asynchronously retries this credential after selected failure statuses.
+	FailureWarmup *FailureWarmupConfig `yaml:"failure-warmup,omitempty" json:"failure-warmup,omitempty"`
 }
 
 func (k CodexKey) GetAPIKey() string  { return k.APIKey }
@@ -557,6 +616,9 @@ type GeminiKey struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// FailureWarmup asynchronously retries this credential after selected failure statuses.
+	FailureWarmup *FailureWarmupConfig `yaml:"failure-warmup,omitempty" json:"failure-warmup,omitempty"`
 }
 
 func (k GeminiKey) GetAPIKey() string  { return k.APIKey }
@@ -604,6 +666,9 @@ type OpenAICompatibility struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// FailureWarmup asynchronously retries this provider after selected failure statuses.
+	FailureWarmup *FailureWarmupConfig `yaml:"failure-warmup,omitempty" json:"failure-warmup,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
@@ -933,6 +998,7 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
+		e.FailureWarmup = NormalizeFailureWarmupConfig(e.FailureWarmup)
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
 			continue
@@ -955,6 +1021,7 @@ func (cfg *Config) SanitizeCodexKeys() {
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
 		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
+		e.FailureWarmup = NormalizeFailureWarmupConfig(e.FailureWarmup)
 		if e.BaseURL == "" {
 			continue
 		}
@@ -973,6 +1040,7 @@ func (cfg *Config) SanitizeClaudeKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.FailureWarmup = NormalizeFailureWarmupConfig(entry.FailureWarmup)
 	}
 }
 
@@ -996,6 +1064,7 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.FailureWarmup = NormalizeFailureWarmupConfig(entry.FailureWarmup)
 		uniqueKey := entry.APIKey + "|" + entry.BaseURL
 		if _, exists := seen[uniqueKey]; exists {
 			continue
