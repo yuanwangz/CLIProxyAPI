@@ -59,6 +59,7 @@ type Detail struct {
 type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
+type usageSuppressedContextKey struct{}
 
 // WithRequestedModelAlias stores the client-requested model name for usage sinks.
 func WithRequestedModelAlias(ctx context.Context, alias string) context.Context {
@@ -150,6 +151,24 @@ func ServiceTierFromContext(ctx context.Context) string {
 	default:
 		return DefaultServiceTier
 	}
+}
+
+// WithUsageSuppressed marks internal provider work that must not publish usage
+// records or appear in management request history.
+func WithUsageSuppressed(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, usageSuppressedContextKey{}, true)
+}
+
+// UsageSuppressedFromContext reports whether usage publication should be skipped.
+func UsageSuppressedFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	suppressed, _ := ctx.Value(usageSuppressedContextKey{}).(bool)
+	return suppressed
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.
@@ -254,6 +273,9 @@ func (m *Manager) RegisterNamed(name string, plugin Plugin) {
 // the record will be discarded downstream.
 func (m *Manager) Publish(ctx context.Context, record Record) {
 	if m == nil {
+		return
+	}
+	if UsageSuppressedFromContext(ctx) {
 		return
 	}
 	// ensure worker is running even if Start was not called explicitly

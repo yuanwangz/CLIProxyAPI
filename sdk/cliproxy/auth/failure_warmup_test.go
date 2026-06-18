@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 type failureWarmupTestExecutor struct {
@@ -18,6 +19,7 @@ type failureWarmupTestExecutor struct {
 	calls       int
 	requests    []cliproxyexecutor.Request
 	options     []cliproxyexecutor.Options
+	suppressed  []bool
 	warmupDone  chan struct{}
 	closeWarmup sync.Once
 }
@@ -26,12 +28,13 @@ func (e *failureWarmupTestExecutor) Identifier() string {
 	return e.id
 }
 
-func (e *failureWarmupTestExecutor) Execute(_ context.Context, _ *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *failureWarmupTestExecutor) Execute(ctx context.Context, _ *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.mu.Lock()
 	e.calls++
 	call := e.calls
 	e.requests = append(e.requests, cloneFailureWarmupRequest(req))
 	e.options = append(e.options, cloneFailureWarmupOptions(opts))
+	e.suppressed = append(e.suppressed, cliproxyusage.UsageSuppressedFromContext(ctx))
 	e.mu.Unlock()
 
 	if call == 1 {
@@ -59,7 +62,7 @@ func (e *failureWarmupTestExecutor) HttpRequest(context.Context, *Auth, *http.Re
 	return nil, nil
 }
 
-func (e *failureWarmupTestExecutor) snapshot() (int, []cliproxyexecutor.Request, []cliproxyexecutor.Options) {
+func (e *failureWarmupTestExecutor) snapshot() (int, []cliproxyexecutor.Request, []cliproxyexecutor.Options, []bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	requests := make([]cliproxyexecutor.Request, len(e.requests))
@@ -70,7 +73,8 @@ func (e *failureWarmupTestExecutor) snapshot() (int, []cliproxyexecutor.Request,
 	for i := range e.options {
 		options[i] = cloneFailureWarmupOptions(e.options[i])
 	}
-	return e.calls, requests, options
+	suppressed := append([]bool(nil), e.suppressed...)
+	return e.calls, requests, options, suppressed
 }
 
 func TestFailureWarmup_ExecuteFailureQueuesAsyncRetryAndClearsState(t *testing.T) {
@@ -138,9 +142,12 @@ func TestFailureWarmup_ExecuteFailureQueuesAsyncRetryAndClearsState(t *testing.T
 		t.Fatalf("interceptor calls = %d, want 1", interceptorCalls)
 	}
 
-	calls, requests, options := executor.snapshot()
+	calls, requests, options, suppressed := executor.snapshot()
 	if calls != 2 {
 		t.Fatalf("execute calls = %d, want 2", calls)
+	}
+	if len(suppressed) != 2 || suppressed[0] || !suppressed[1] {
+		t.Fatalf("usage suppression flags = %v, want [false true]", suppressed)
 	}
 	if len(requests) != 2 || string(requests[1].Payload) != "rewritten" {
 		t.Fatalf("warmup request payload = %q, want rewritten", string(requests[1].Payload))

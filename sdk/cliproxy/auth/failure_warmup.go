@@ -11,6 +11,7 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -159,7 +160,7 @@ func (q *failureWarmupQueue) executeAttempt(task failureWarmupTask) error {
 	req := cloneFailureWarmupRequest(task.request)
 	opts := cloneFailureWarmupOptions(task.options)
 
-	ctx := context.Background()
+	ctx := cliproxyusage.WithUsageSuppressed(context.Background())
 	if q != nil && q.manager != nil {
 		if rt := q.manager.roundTripperFor(auth); rt != nil {
 			ctx = context.WithValue(ctx, roundTripperContextKey{}, rt)
