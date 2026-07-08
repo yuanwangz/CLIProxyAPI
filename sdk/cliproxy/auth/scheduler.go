@@ -554,7 +554,7 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 		return
 	}
 	authID := strings.TrimSpace(auth.ID)
-	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	providerKey := executorKeyFromAuth(auth)
 	if authID == "" || providerKey == "" || auth.Disabled || auth.Archived || auth.Status == StatusArchived {
 		s.removeAuthLocked(authID)
 		return
@@ -618,7 +618,7 @@ func (s *authScheduler) clearFillFirstStickyLocked() {
 
 // buildScheduledAuthMeta extracts the scheduling metadata needed for shard bookkeeping.
 func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
-	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	providerKey := executorKeyFromAuth(auth)
 	virtualParent := ""
 	if auth.Attributes != nil {
 		virtualParent = strings.TrimSpace(auth.Attributes["gemini_virtual_parent"])
@@ -1124,7 +1124,7 @@ func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
 	return bucket
 }
 
-// buildReadyView creates either a flat view or a grouped parent/child view for rotation.
+// buildReadyView creates a flat view for rotation.
 func buildReadyView(entries []*scheduledAuth) readyView {
 	view := readyView{flat: append([]*scheduledAuth(nil), entries...)}
 	if len(entries) == 0 {

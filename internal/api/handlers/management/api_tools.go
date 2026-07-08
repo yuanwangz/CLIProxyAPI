@@ -289,20 +289,88 @@ func firstNonEmptyString(values ...*string) string {
 	return ""
 }
 
+func geminiOAuthMetadata(auth *coreauth.Auth) (map[string]any, func(map[string]any)) {
+	if auth == nil {
+		return nil, nil
+	}
+	if shared := geminicli.ResolveSharedCredential(auth.Runtime); shared != nil {
+		snapshot := shared.MetadataSnapshot()
+		return snapshot, func(fields map[string]any) { shared.MergeMetadata(fields) }
+	}
+	return auth.Metadata, func(fields map[string]any) {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		for k, v := range fields {
+			auth.Metadata[k] = v
+		}
+	}
+}
+
+func cloneMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func buildOAuthTokenMap(base map[string]any, tok *oauth2.Token) map[string]any {
+	merged := cloneMap(base)
+	if merged == nil {
+		merged = make(map[string]any)
+	}
+	if tok == nil {
+		return merged
+	}
+	if raw, errMarshal := json.Marshal(tok); errMarshal == nil {
+		var tokenMap map[string]any
+		if errUnmarshal := json.Unmarshal(raw, &tokenMap); errUnmarshal == nil {
+			for k, v := range tokenMap {
+				merged[k] = v
+			}
+		}
+	}
+	return merged
+}
+
+func buildOAuthTokenFields(tok *oauth2.Token, merged map[string]any) map[string]any {
+	fields := make(map[string]any, 5)
+	if tok != nil && tok.AccessToken != "" {
+		fields["access_token"] = tok.AccessToken
+	}
+	if tok != nil && tok.TokenType != "" {
+		fields["token_type"] = tok.TokenType
+	}
+	if tok != nil && tok.RefreshToken != "" {
+		fields["refresh_token"] = tok.RefreshToken
+	}
+	if tok != nil && !tok.Expiry.IsZero() {
+		fields["expiry"] = tok.Expiry.Format(time.RFC3339)
+	}
+	if len(merged) > 0 {
+		fields["token"] = cloneMap(merged)
+	}
+	return fields
+}
+
 func tokenValueForAuth(auth *coreauth.Auth) string {
 	if auth == nil {
 		return ""
+	}
+	if shared := geminicli.ResolveSharedCredential(auth.Runtime); shared != nil {
+		if v := tokenValueFromMetadata(shared.MetadataSnapshot()); v != "" {
+			return v
+		}
 	}
 	if v := tokenValueFromMetadata(auth.Metadata); v != "" {
 		return v
 	}
 	if auth.Attributes != nil {
 		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			return v
-		}
-	}
-	if shared := geminicli.ResolveSharedCredential(auth.Runtime); shared != nil {
-		if v := tokenValueFromMetadata(shared.MetadataSnapshot()); v != "" {
 			return v
 		}
 	}
@@ -552,24 +620,6 @@ func int64Value(raw any) int64 {
 	return 0
 }
 
-func geminiOAuthMetadata(auth *coreauth.Auth) (map[string]any, func(map[string]any)) {
-	if auth == nil {
-		return nil, nil
-	}
-	if shared := geminicli.ResolveSharedCredential(auth.Runtime); shared != nil {
-		snapshot := shared.MetadataSnapshot()
-		return snapshot, func(fields map[string]any) { shared.MergeMetadata(fields) }
-	}
-	return auth.Metadata, func(fields map[string]any) {
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
-		}
-		for k, v := range fields {
-			auth.Metadata[k] = v
-		}
-	}
-}
-
 func stringValue(metadata map[string]any, key string) string {
 	if len(metadata) == 0 || key == "" {
 		return ""
@@ -578,56 +628,6 @@ func stringValue(metadata map[string]any, key string) string {
 		return strings.TrimSpace(v)
 	}
 	return ""
-}
-
-func cloneMap(in map[string]any) map[string]any {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func buildOAuthTokenMap(base map[string]any, tok *oauth2.Token) map[string]any {
-	merged := cloneMap(base)
-	if merged == nil {
-		merged = make(map[string]any)
-	}
-	if tok == nil {
-		return merged
-	}
-	if raw, errMarshal := json.Marshal(tok); errMarshal == nil {
-		var tokenMap map[string]any
-		if errUnmarshal := json.Unmarshal(raw, &tokenMap); errUnmarshal == nil {
-			for k, v := range tokenMap {
-				merged[k] = v
-			}
-		}
-	}
-	return merged
-}
-
-func buildOAuthTokenFields(tok *oauth2.Token, merged map[string]any) map[string]any {
-	fields := make(map[string]any, 5)
-	if tok != nil && tok.AccessToken != "" {
-		fields["access_token"] = tok.AccessToken
-	}
-	if tok != nil && tok.TokenType != "" {
-		fields["token_type"] = tok.TokenType
-	}
-	if tok != nil && tok.RefreshToken != "" {
-		fields["refresh_token"] = tok.RefreshToken
-	}
-	if tok != nil && !tok.Expiry.IsZero() {
-		fields["expiry"] = tok.Expiry.Format(time.RFC3339)
-	}
-	if len(merged) > 0 {
-		fields["token"] = cloneMap(merged)
-	}
-	return fields
 }
 
 func tokenValueFromMetadata(metadata map[string]any) string {
@@ -792,6 +792,10 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
 	case "gemini":
 		if entry := resolveAPIKeyConfig(cfg.GeminiKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyURL)
+		}
+	case "gemini-interactions":
+		if entry := resolveAPIKeyConfig(cfg.InteractionsKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
 	case "claude":

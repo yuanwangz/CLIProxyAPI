@@ -53,7 +53,7 @@ func (m *Manager) ExecuteSelectedAuth(ctx context.Context, providers []string, m
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return nil, errWait
 		}
 	}

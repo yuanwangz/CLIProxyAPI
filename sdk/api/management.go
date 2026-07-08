@@ -19,8 +19,8 @@ type Handler = internalmanagement.Handler
 // ManagementTokenRequester exposes a limited subset of management endpoints for requesting tokens.
 type ManagementTokenRequester interface {
 	RequestAnthropicToken(*gin.Context)
-	RequestGeminiCLIToken(*gin.Context)
 	RequestCodexToken(*gin.Context)
+	RequestGeminiCLIToken(*gin.Context)
 	RequestAntigravityToken(*gin.Context)
 	RequestKimiToken(*gin.Context)
 	GetAuthStatus(c *gin.Context)
@@ -52,12 +52,12 @@ func (m *managementTokenRequester) RequestAnthropicToken(c *gin.Context) {
 	m.handler.RequestAnthropicToken(c)
 }
 
-func (m *managementTokenRequester) RequestGeminiCLIToken(c *gin.Context) {
-	m.handler.RequestGeminiCLIToken(c)
-}
-
 func (m *managementTokenRequester) RequestCodexToken(c *gin.Context) {
 	m.handler.RequestCodexToken(c)
+}
+
+func (m *managementTokenRequester) RequestGeminiCLIToken(c *gin.Context) {
+	m.handler.RequestGeminiCLIToken(c)
 }
 
 func (m *managementTokenRequester) RequestAntigravityToken(c *gin.Context) {

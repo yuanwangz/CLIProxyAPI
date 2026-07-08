@@ -122,6 +122,19 @@ func mergeRecentRequestBuckets(dst, src []coreauth.RecentRequestBucket) []coreau
 	return dst
 }
 
+func apiKeyUsageProviderKey(auth *coreauth.Auth) string {
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if auth.Attributes != nil {
+		if compatName := strings.TrimSpace(auth.Attributes["compat_name"]); compatName != "" {
+			provider = strings.ToLower(compatName)
+		}
+	}
+	if provider == "" {
+		return "unknown"
+	}
+	return provider
+}
+
 func coreRecentRequestBuckets(buckets []usagepersist.RecentRequestBucket) []coreauth.RecentRequestBucket {
 	if len(buckets) == 0 {
 		return nil
@@ -419,10 +432,7 @@ func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 			}
 		}
 		compositeKey := baseURL + "|" + apiKey
-		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-		if provider == "" {
-			provider = "unknown"
-		}
+		provider := apiKeyUsageProviderKey(auth)
 		authIndex := strings.TrimSpace(auth.EnsureIndex())
 		auths = append(auths, apiKeyUsageAuth{
 			auth:         auth,
