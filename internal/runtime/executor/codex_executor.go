@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexquota"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -803,6 +804,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -976,6 +978,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -1091,6 +1094,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -1591,6 +1595,23 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		ginHeaders = ginCtx.Request.Header
 	}
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+}
+
+// applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
+func applyModelHeaderOverrides(headers http.Header, modelName string) {
+	if headers == nil {
+		return
+	}
+	overrides := registry.ModelOverrideHeaders(modelName)
+	if len(overrides) == 0 {
+		return
+	}
+	for key, value := range overrides {
+		headers.Set(key, value)
+	}
+	if strings.Contains(headers.Get("User-Agent"), "Mac OS") && codexSessionHeaderValue(headers) == "" {
+		headers.Set("Session_id", uuid.NewString())
+	}
 }
 
 // applyCodexDirectImageHeaders sets Codex upstream headers for direct /images/* calls.
