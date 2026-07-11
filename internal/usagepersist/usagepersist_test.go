@@ -103,6 +103,9 @@ func TestBuildEventUsesFailureStatusCodeForProviderAttempt(t *testing.T) {
 	if len(details) != 1 || details[0].Error != "usage limit reached" {
 		t.Fatalf("payload error details = %+v, want failure body", details)
 	}
+	if details[0].Provider != "codex" {
+		t.Fatalf("payload provider = %q, want codex", details[0].Provider)
+	}
 }
 
 func TestBuildEventPrefersFailureStatusCodeOverResponseOK(t *testing.T) {

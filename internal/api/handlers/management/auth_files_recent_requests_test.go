@@ -93,6 +93,41 @@ func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
 	}
 }
 
+func TestListAuthFiles_ExposesXAIIdentityWithoutTokens(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "xai-runtime-auth",
+		Provider:   "xai",
+		Attributes: map[string]string{"runtime_only": "true"},
+		Metadata: map[string]any{
+			"type":          "xai",
+			"sub":           "xai-user-123",
+			"access_token":  "secret-access-token",
+			"refresh_token": "secret-refresh-token",
+			"id_token":      "secret-id-token",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register xAI auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = &memoryAuthStore{}
+	entry := h.buildAuthFileEntry(record)
+
+	if subject, _ := entry["sub"].(string); subject != "xai-user-123" {
+		t.Fatalf("sub = %#v, want xai-user-123", entry["sub"])
+	}
+	for _, secretField := range []string{"access_token", "refresh_token", "id_token"} {
+		if _, exists := entry[secretField]; exists {
+			t.Fatalf("auth file entry exposed secret field %q: %#v", secretField, entry)
+		}
+	}
+}
+
 func TestListAuthFiles_HidesExpiredCooldownFromManagementStatus(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

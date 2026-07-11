@@ -102,6 +102,7 @@ type Tokens struct {
 
 type Detail struct {
 	Timestamp  string `json:"timestamp"`
+	Provider   string `json:"provider,omitempty"`
 	Source     string `json:"source"`
 	SourceFull string `json:"source_full,omitempty"`
 	SourceHash string `json:"source_hash,omitempty"`
@@ -1548,6 +1549,7 @@ func BuildPayload(events []Event) Payload {
 		}
 		modelEntry.Details = append(modelEntry.Details, Detail{
 			Timestamp:  event.Timestamp,
+			Provider:   event.Provider,
 			Source:     event.Source,
 			SourceFull: event.SourceFull,
 			SourceHash: event.SourceHash,

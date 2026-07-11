@@ -430,6 +430,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if strings.EqualFold(strings.TrimSpace(typeValue), "xai") {
+					if subject := strings.TrimSpace(gjson.GetBytes(data, "sub").String()); subject != "" {
+						fileData["sub"] = subject
+					}
+				}
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
@@ -510,6 +515,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") && auth.Metadata != nil {
+		if subject, ok := auth.Metadata["sub"].(string); ok && strings.TrimSpace(subject) != "" {
+			entry["sub"] = strings.TrimSpace(subject)
+		}
 	}
 	if projectID := authProjectID(auth); projectID != "" {
 		entry["project_id"] = projectID
