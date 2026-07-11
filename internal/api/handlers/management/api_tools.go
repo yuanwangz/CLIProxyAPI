@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -138,34 +139,6 @@ func (h *Handler) APICall(c *gin.Context) {
 		reqHeaders = map[string]string{}
 	}
 
-	var hostOverride string
-	var token string
-	var tokenResolved bool
-	var tokenInjected bool
-	var tokenErr error
-	for key, value := range reqHeaders {
-		if !strings.Contains(value, "$TOKEN$") {
-			continue
-		}
-		if !tokenResolved {
-			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
-			tokenResolved = true
-		}
-		if auth != nil && token == "" {
-			if tokenErr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
-				return
-			}
-			c.JSON(http.StatusBadRequest, gin.H{"error": "auth token not found"})
-			return
-		}
-		if token == "" {
-			continue
-		}
-		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
-		tokenInjected = true
-	}
-
 	var requestBody io.Reader
 	if body.Data != "" {
 		requestBody = strings.NewReader(body.Data)
@@ -177,6 +150,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	var hostOverride string
 	for key, value := range reqHeaders {
 		if strings.EqualFold(key, "host") {
 			hostOverride = strings.TrimSpace(value)
@@ -186,6 +160,55 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 	if hostOverride != "" {
 		req.Host = hostOverride
+	}
+
+	// Credential custom headers override management-page defaults before token
+	// substitution, so an explicit Authorization value can bypass the stored
+	// OAuth token for quota and inspection requests.
+	if auth != nil {
+		util.ApplyCustomHeadersFromAttrs(req, auth.Attributes)
+	}
+
+	var token string
+	var tokenResolved bool
+	var tokenInjected bool
+	var tokenErr error
+	replaceToken := func(value string) (string, bool) {
+		if !strings.Contains(value, "$TOKEN$") {
+			return value, true
+		}
+		if !tokenResolved {
+			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
+			tokenResolved = true
+		}
+		if auth != nil && token == "" {
+			if tokenErr != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
+				return "", false
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": "auth token not found"})
+			return "", false
+		}
+		if token == "" {
+			return value, true
+		}
+		tokenInjected = true
+		return strings.ReplaceAll(value, "$TOKEN$", token), true
+	}
+
+	for _, values := range req.Header {
+		for index, value := range values {
+			replaced, okReplace := replaceToken(value)
+			if !okReplace {
+				return
+			}
+			values[index] = replaced
+		}
+	}
+	if replacedHost, okReplace := replaceToken(req.Host); !okReplace {
+		return
+	} else {
+		req.Host = replacedHost
 	}
 
 	httpClient := &http.Client{

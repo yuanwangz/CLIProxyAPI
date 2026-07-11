@@ -198,6 +198,7 @@ type cooldownCommand struct {
 	state  CooldownState
 	authID string
 	model  string
+	done   chan error
 }
 
 func DefaultDBPath(wd string, writableBase string) string {
@@ -430,23 +431,26 @@ func (p *Plugin) run() {
 func runCooldownCommands() {
 	for command := range cooldownCh {
 		store := DefaultStore()
-		if store == nil {
-			continue
-		}
-		ctx := context.Background()
 		var err error
-		switch command.action {
-		case "upsert":
-			err = store.UpsertCooldown(ctx, command.state)
-		case "delete":
-			err = store.DeleteCooldown(ctx, command.authID, command.model)
-		case "delete-auth":
-			err = store.DeleteAuthCooldowns(ctx, command.authID)
-		case "delete-auth-quota":
-			err = store.DeleteAuthQuotaCooldowns(ctx, command.authID)
+		if store != nil {
+			ctx := context.Background()
+			switch command.action {
+			case "upsert":
+				err = store.UpsertCooldown(ctx, command.state)
+			case "delete":
+				err = store.DeleteCooldown(ctx, command.authID, command.model)
+			case "delete-auth":
+				err = store.DeleteAuthCooldowns(ctx, command.authID)
+			case "delete-auth-quota":
+				err = store.DeleteAuthQuotaCooldowns(ctx, command.authID)
+			}
 		}
 		if err != nil {
 			log.WithError(err).Warn("failed to update persisted auth cooldown")
+		}
+		if command.done != nil {
+			command.done <- err
+			close(command.done)
 		}
 	}
 }
@@ -476,11 +480,11 @@ func ClearCooldownAsync(authID, model string) {
 }
 
 func ClearCooldown(ctx context.Context, authID, model string) error {
-	store := DefaultStore()
-	if store == nil {
-		return nil
-	}
-	return store.DeleteCooldown(ctx, authID, model)
+	return enqueueCooldownCommandAndWait(ctx, cooldownCommand{
+		action: "delete",
+		authID: strings.TrimSpace(authID),
+		model:  strings.TrimSpace(model),
+	})
 }
 
 func ClearAuthCooldownsAsync(authID string) {
@@ -498,11 +502,31 @@ func ClearAuthQuotaCooldownsAsync(authID string) {
 }
 
 func ClearAuthQuotaCooldowns(ctx context.Context, authID string) error {
-	store := DefaultStore()
-	if store == nil {
+	return enqueueCooldownCommandAndWait(ctx, cooldownCommand{
+		action: "delete-auth-quota",
+		authID: strings.TrimSpace(authID),
+	})
+}
+
+func enqueueCooldownCommandAndWait(ctx context.Context, command cooldownCommand) error {
+	if cooldownCh == nil {
 		return nil
 	}
-	return store.DeleteAuthQuotaCooldowns(ctx, authID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	command.done = make(chan error, 1)
+	select {
+	case cooldownCh <- command:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-command.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func enqueueCooldownCommand(command cooldownCommand) {

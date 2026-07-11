@@ -171,3 +171,38 @@ func TestCooldownAsyncPersistsWhenUsageStatisticsDisabled(t *testing.T) {
 	}
 	t.Fatal("cooldown was not persisted while usage statistics were disabled")
 }
+
+func TestClearCooldownWaitsForQueuedUpdates(t *testing.T) {
+	ctx := context.Background()
+	if err := Init(filepath.Join(t.TempDir(), "usage.sqlite"), false); err != nil {
+		t.Fatalf("init usage persistence: %v", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		PersistCooldownAsync(CooldownState{
+			AuthID:         "auth-clear-after-queue",
+			Provider:       "claude",
+			Model:          "claude-opus-4-8",
+			Reason:         "quota",
+			HTTPStatus:     http.StatusTooManyRequests,
+			NextRetryAfter: time.Now().Add(time.Hour),
+			QuotaExceeded:  true,
+		})
+	}
+
+	if err := ClearCooldown(ctx, "auth-clear-after-queue", "claude-opus-4-8"); err != nil {
+		t.Fatalf("clear cooldown: %v", err)
+	}
+
+	store := DefaultStore()
+	if store == nil {
+		t.Fatal("default store is not initialized")
+	}
+	active, err := store.ActiveCooldownsByAuth(ctx, "auth-clear-after-queue", time.Now())
+	if err != nil {
+		t.Fatalf("active cooldowns: %v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active cooldowns after queued clear = %+v, want none", active)
+	}
+}

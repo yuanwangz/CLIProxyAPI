@@ -285,6 +285,64 @@ func TestAPICallUnauthorizedFromUntrustedHostDoesNotDisableAuth(t *testing.T) {
 	}
 }
 
+func TestAPICallCustomAuthorizationOverridesTokenPlaceholder(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer custom-token" {
+			t.Fatalf("Authorization = %q, want Bearer custom-token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "api-call-custom-header-auth",
+		FileName: "api-call-custom-header.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token": "default-token",
+			"headers": map[string]any{
+				"authorization": "Bearer custom-token",
+			},
+		},
+	}
+	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	payload := map[string]any{
+		"auth_index": auth.EnsureIndex(),
+		"method":     http.MethodGet,
+		"url":        upstream.URL,
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+		},
+	}
+	body, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		t.Fatalf("marshal payload: %v", errMarshal)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.APICall(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
 func TestShouldMarkAPICallUnauthorizedRequiresInjectedTokenAndTrustedProviderURL(t *testing.T) {
 	t.Parallel()
 
