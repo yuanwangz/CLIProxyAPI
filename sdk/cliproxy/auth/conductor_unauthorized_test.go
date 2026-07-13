@@ -114,3 +114,38 @@ func TestManager_MarkResultSuccessDoesNotReenableDisabledAuth(t *testing.T) {
 		t.Fatalf("LastError = %#v, want preserved HTTP 401", updated.LastError)
 	}
 }
+
+func TestManager_MarkResultUnauthorizedPreservesAuthForOptionalCapability(t *testing.T) {
+	ctx := WithPreserveAuthOnUnauthorized(context.Background())
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := &Auth{ID: "image-unauthorized", Provider: "codex", Status: StatusActive}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-image-2",
+		Error: &Error{
+			Code:       "unauthorized",
+			Message:    "image endpoint unauthorized",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("missing auth %s", auth.ID)
+	}
+	if updated.Disabled || updated.Status == StatusDisabled {
+		t.Fatalf("image 401 disabled auth: %#v", updated)
+	}
+	if updated.LastError != nil {
+		t.Fatalf("auth-level LastError = %#v, want nil", updated.LastError)
+	}
+	state := updated.ModelStates["gpt-image-2"]
+	if state == nil || state.LastError == nil || state.LastError.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("image model state = %#v, want model-scoped 401", state)
+	}
+}

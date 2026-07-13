@@ -173,6 +173,26 @@ type Result struct {
 	Error *Error
 }
 
+type preserveAuthOnUnauthorizedContextKey struct{}
+
+// WithPreserveAuthOnUnauthorized scopes HTTP 401 failures to the attempted model.
+// Optional capabilities such as image generation use this so their endpoint-specific
+// authorization failures cannot disable credentials that remain valid for text requests.
+func WithPreserveAuthOnUnauthorized(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, preserveAuthOnUnauthorizedContextKey{}, true)
+}
+
+func preserveAuthOnUnauthorized(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	preserve, _ := ctx.Value(preserveAuthOnUnauthorizedContextKey{}).(bool)
+	return preserve
+}
+
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
@@ -3882,14 +3902,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					state.Unavailable = true
 					state.Status = StatusError
 					state.UpdatedAt = now
+					statusCode := statusCodeFromResult(result.Error)
+					preserveUnauthorized := statusCode == http.StatusUnauthorized && preserveAuthOnUnauthorized(ctx)
 					if result.Error != nil {
 						state.LastError = cloneError(result.Error)
 						state.StatusMessage = result.Error.Message
-						auth.LastError = cloneError(result.Error)
-						auth.StatusMessage = result.Error.Message
+						if !preserveUnauthorized {
+							auth.LastError = cloneError(result.Error)
+							auth.StatusMessage = result.Error.Message
+						}
 					}
-
-					statusCode := statusCodeFromResult(result.Error)
 					if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
@@ -3921,7 +3943,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 401:
 							state.NextRetryAfter = time.Time{}
 							state.Quota = QuotaState{}
-							applyUnauthorizedDisabledState(auth, result.Error, now)
+							if !preserveUnauthorized {
+								applyUnauthorizedDisabledState(auth, result.Error, now)
+							}
 							clearModelQuota = true
 						case 402, 403:
 							if disableCooling {
@@ -6139,6 +6163,9 @@ func authHasRefreshCredential(auth *Auth) bool {
 // current auth can be retried before fallback/suspend.
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool) {
 	if m == nil || auth == nil || alreadyTried || execErr == nil {
+		return auth, false
+	}
+	if preserveAuthOnUnauthorized(ctx) {
 		return auth, false
 	}
 	if !isUnauthorizedError(execErr) || !authHasRefreshCredential(auth) {

@@ -221,6 +221,7 @@ func (h *OpenAIAPIHandler) collectRoutedImagesWithFallback(c *gin.Context, image
 	c.Header("Content-Type", "application/json")
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = coreauth.WithPreserveAuthOnUnauthorized(cliCtx)
 	selectedAuth := &selectedAuthCapture{}
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, selectedAuth.Set)
 	primaryCtx := handlers.WithDisallowFreeAuth(cliCtx)
@@ -358,6 +359,7 @@ func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context
 	c.Header("Content-Type", "application/json")
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = coreauth.WithPreserveAuthOnUnauthorized(cliCtx)
 	selectedAuth := &selectedAuthCapture{}
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, selectedAuth.Set)
 	cliCtx = executorhelps.WithFailureUsageSuppressed(cliCtx)
@@ -469,6 +471,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponsesWithFallback(c *gin.Context,
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = coreauth.WithPreserveAuthOnUnauthorized(cliCtx)
 	selectedAuth := &selectedAuthCapture{}
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, selectedAuth.Set)
 	cliCtx = executorhelps.WithFailureUsageSuppressed(cliCtx)
@@ -569,6 +572,7 @@ func (h *OpenAIAPIHandler) streamRoutedImagesWithFallback(c *gin.Context, imageR
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = coreauth.WithPreserveAuthOnUnauthorized(cliCtx)
 	selectedAuth := &selectedAuthCapture{}
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, selectedAuth.Set)
 	primaryCtx := handlers.WithDisallowFreeAuth(cliCtx)
@@ -800,7 +804,7 @@ func (h *OpenAIAPIHandler) shouldUseImageFallbackAfterRoutedError(errMsg *interf
 		return true
 	}
 	switch errMsg.StatusCode {
-	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
 	return errMsg.StatusCode >= http.StatusInternalServerError

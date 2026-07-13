@@ -125,6 +125,32 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 	}
 }
 
+func TestCodexExecutorDirectOpenAIImageGenerationUsesCustomAuthorizationHeader(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"created":1713833628,"data":[{"b64_json":"AA=="}]}`))
+	}))
+	defer server.Close()
+
+	auth := newCodexOpenAIImageTestAuth(server.URL)
+	delete(auth.Attributes, "api_key")
+	auth.Metadata = map[string]any{"access_token": "stored-oauth-token"}
+	auth.Attributes["header:authorization"] = "Bearer custom-image-token"
+	executor := NewCodexExecutor(&config.Config{})
+	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-image-2",
+		Payload: []byte(`{"model":"gpt-image-2","prompt":"draw"}`),
+	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, false))
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if gotAuth != "Bearer custom-image-token" {
+		t.Fatalf("Authorization = %q, want custom header token", gotAuth)
+	}
+}
+
 func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testing.T) {
 	var gotPath string
 	var gotAccept string

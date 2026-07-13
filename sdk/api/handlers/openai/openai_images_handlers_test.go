@@ -499,6 +499,90 @@ func TestRoutedImageStreamFallbackWebUnauthorizedRestartsPrimaryWithNextAuth(t *
 	}
 }
 
+func TestImagesPrimaryUnauthorizedRotatesWithoutDisablingCredential(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			firstAuthID := "aa-primary-image-unauthorized-" + name
+			secondAuthID := "bb-primary-image-ready-" + name
+			primaryExecutor := &authAwareImagesExecutor{
+				failures: map[string]error{
+					firstAuthID: &testImagesStatusError{status: http.StatusUnauthorized, message: "primary image unauthorized"},
+				},
+				refreshErr: &testImagesStatusError{status: http.StatusUnauthorized, message: "refresh unauthorized"},
+				response:   []byte(`{"created":123,"data":[{"b64_json":"AA=="}]}`),
+			}
+			if stream {
+				primaryExecutor.response = []byte("event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\"}\n\n")
+			}
+			manager.RegisterExecutor(primaryExecutor)
+
+			auths := []*coreauth.Auth{
+				{ID: firstAuthID, Provider: "codex", Metadata: map[string]any{"email": "a@example.com", "access_token": "token-a", "refresh_token": "refresh-a", "plan_type": "plus"}},
+				{ID: secondAuthID, Provider: "codex", Metadata: map[string]any{"email": "b@example.com", "access_token": "token-b", "refresh_token": "refresh-b", "plan_type": "plus"}},
+			}
+			reg := registry.GetGlobalRegistry()
+			for _, auth := range auths {
+				reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{
+					{ID: defaultImagesToolModel, Object: "model", OwnedBy: "codex", Type: registry.OpenAIImageModelType},
+					{ID: imagesfallback.TextAuthSelectionModel, Object: "model", OwnedBy: "codex", Type: "codex"},
+				})
+				if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+					t.Fatalf("register %s: %v", auth.ID, errRegister)
+				}
+			}
+			t.Cleanup(func() {
+				for _, auth := range auths {
+					reg.UnregisterClient(auth.ID)
+				}
+			})
+
+			fallbackService := &fakeImagesFallbackService{}
+			previousFactory := newImageFallbackService
+			newImageFallbackService = func(*sdkconfig.SDKConfig, *coreauth.Manager) imageFallbackService {
+				return fallbackService
+			}
+			t.Cleanup(func() {
+				newImageFallbackService = previousFactory
+			})
+
+			handler := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+			requestBody := `{"model":"gpt-image-2","prompt":"draw","response_format":"b64_json"}`
+			if stream {
+				requestBody = `{"model":"gpt-image-2","prompt":"draw","response_format":"b64_json","stream":true}`
+			}
+			resp := performImagesEndpointRequest(t, imagesGenerationsPath, "application/json", strings.NewReader(requestBody), handler.ImagesGenerations)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200: %s", resp.Code, resp.Body.String())
+			}
+
+			primarySequence := primaryExecutor.authIDs
+			if stream {
+				primarySequence = primaryExecutor.streamAuthIDs
+			}
+			if got := strings.Join(primarySequence, ","); got != firstAuthID+","+secondAuthID {
+				t.Fatalf("primary auth sequence = %s, want %s,%s", got, firstAuthID, secondAuthID)
+			}
+			if len(primaryExecutor.refreshAuthIDs) != 0 {
+				t.Fatalf("image 401 triggered OAuth refresh: %v", primaryExecutor.refreshAuthIDs)
+			}
+			if fallbackService.Calls() != 0 {
+				t.Fatalf("fallback calls = %d, want 0 after next primary succeeds", fallbackService.Calls())
+			}
+
+			firstUpdated, ok := manager.GetByID(firstAuthID)
+			if !ok || firstUpdated == nil || firstUpdated.Disabled || firstUpdated.Status == coreauth.StatusDisabled {
+				t.Fatalf("primary image 401 disabled auth: %#v", firstUpdated)
+			}
+		})
+	}
+}
+
 func TestImagesGenerationsRejectsUnsupportedModel(t *testing.T) {
 	handler := &OpenAIAPIHandler{}
 	body := strings.NewReader(`{"model":"gpt-5.4-mini","prompt":"draw a square"}`)
@@ -591,10 +675,12 @@ type failingImagesExecutor struct {
 }
 
 type authAwareImagesExecutor struct {
-	failures      map[string]error
-	response      []byte
-	authIDs       []string
-	streamAuthIDs []string
+	failures       map[string]error
+	refreshErr     error
+	response       []byte
+	authIDs        []string
+	streamAuthIDs  []string
+	refreshAuthIDs []string
 }
 
 func (e *authAwareImagesExecutor) Identifier() string { return "codex" }
@@ -619,6 +705,10 @@ func (e *authAwareImagesExecutor) ExecuteStream(_ context.Context, auth *coreaut
 }
 
 func (e *authAwareImagesExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	e.refreshAuthIDs = append(e.refreshAuthIDs, auth.ID)
+	if e.refreshErr != nil {
+		return nil, e.refreshErr
+	}
 	return auth, nil
 }
 
