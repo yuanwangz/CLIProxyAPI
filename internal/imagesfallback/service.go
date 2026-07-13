@@ -52,12 +52,14 @@ func (s *Service) ExecuteWithAuthManager(ctx context.Context, req Request, selec
 	}
 	metadata := map[string]any{
 		coreexecutor.RequestedModelMetadataKey: model,
+		// Web-image authorization failures are endpoint-specific and must not disable text credentials.
+		coreexecutor.SkipSelectedAuthResultMetadataKey: true,
 	}
 	if selectedCallback != nil {
 		metadata[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
 	opts := coreexecutor.Options{Metadata: metadata}
-	value, err := s.authManager.ExecuteSelectedAuth(ctx, []string{"codex"}, model, opts, func(execCtx context.Context, auth *coreauth.Auth, _ string) (any, error) {
+	value, err := s.authManager.ExecuteSelectedAuth(ctx, []string{"codex"}, TextAuthSelectionModel, opts, func(execCtx context.Context, auth *coreauth.Auth, _ string) (any, error) {
 		if !IsCodexOAuthAuth(auth) {
 			return nil, &coreauth.SkipSelectedAuthError{Reason: "image fallback requires a Codex OAuth auth"}
 		}

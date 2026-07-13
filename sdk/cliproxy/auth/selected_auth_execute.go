@@ -69,6 +69,7 @@ func (m *Manager) executeSelectedAuthOnce(ctx context.Context, providers []strin
 	}
 
 	opts = ensureRequestedModelMetadata(opts, model)
+	skipResultTracking, _ := opts.Metadata[cliproxyexecutor.SkipSelectedAuthResultMetadataKey].(bool)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
@@ -102,7 +103,9 @@ func (m *Manager) executeSelectedAuthOnce(ctx context.Context, providers []strin
 
 		value, errExec := run(execCtx, auth, provider)
 		if errExec == nil {
-			m.MarkResult(execCtx, Result{AuthID: auth.ID, Provider: provider, Model: model, Success: true})
+			if !skipResultTracking {
+				m.MarkResult(execCtx, Result{AuthID: auth.ID, Provider: provider, Model: model, Success: true})
+			}
 			return value, nil
 		}
 		var skipErr *SkipSelectedAuthError
@@ -119,7 +122,9 @@ func (m *Manager) executeSelectedAuthOnce(ctx context.Context, providers []strin
 		}
 		result := Result{AuthID: auth.ID, Provider: provider, Model: model, Success: false, Error: rerr}
 		result.RetryAfter = retryAfterFromError(errExec)
-		m.MarkResult(execCtx, result)
+		if !skipResultTracking {
+			m.MarkResult(execCtx, result)
+		}
 		if isRequestInvalidError(errExec) {
 			return nil, errExec
 		}

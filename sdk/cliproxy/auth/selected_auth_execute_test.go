@@ -65,3 +65,52 @@ func TestExecuteSelectedAuth_ModelScopedCooldownDoesNotBlockOtherModels(t *testi
 		t.Fatalf("text selected auth = %v, want %s", gotText, badAuth.ID)
 	}
 }
+
+func TestExecuteSelectedAuth_SkipResultTrackingRotatesWithoutChangingAuthHealth(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(&authFallbackExecutor{id: "codex"})
+
+	model := "gpt-image-2"
+	firstAuth := &Auth{ID: "aa-web-image-unauthorized", Provider: "codex"}
+	secondAuth := &Auth{ID: "bb-web-image-ready", Provider: "codex"}
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range []*Auth{firstAuth, secondAuth} {
+		reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register %s: %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		reg.UnregisterClient(firstAuth.ID)
+		reg.UnregisterClient(secondAuth.ID)
+	})
+
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.SkipSelectedAuthResultMetadataKey: true,
+	}}
+	value, errExecute := manager.ExecuteSelectedAuth(context.Background(), []string{"codex"}, model, opts, func(_ context.Context, auth *Auth, _ string) (any, error) {
+		if auth.ID == firstAuth.ID {
+			return nil, &Error{HTTPStatus: http.StatusUnauthorized, Message: "web image unauthorized"}
+		}
+		return auth.ID, nil
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteSelectedAuth() error = %v", errExecute)
+	}
+	if value != secondAuth.ID {
+		t.Fatalf("ExecuteSelectedAuth() value = %v, want %s", value, secondAuth.ID)
+	}
+
+	for _, authID := range []string{firstAuth.ID, secondAuth.ID} {
+		updated, ok := manager.GetByID(authID)
+		if !ok || updated == nil {
+			t.Fatalf("missing auth %s", authID)
+		}
+		if updated.Disabled || updated.Status == StatusDisabled || updated.LastError != nil {
+			t.Fatalf("auth %s health changed: %#v", authID, updated)
+		}
+		if updated.Success != 0 || updated.Failed != 0 {
+			t.Fatalf("auth %s counters = success:%d failed:%d, want zero", authID, updated.Success, updated.Failed)
+		}
+	}
+}

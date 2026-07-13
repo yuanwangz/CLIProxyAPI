@@ -34,6 +34,9 @@ const (
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
+	// SkipSelectedAuthResultMetadataKey keeps ExecuteSelectedAuth responsible only for rotation.
+	// The callback owns result tracking when it runs a nested provider execution.
+	SkipSelectedAuthResultMetadataKey = "skip_selected_auth_result"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
 )

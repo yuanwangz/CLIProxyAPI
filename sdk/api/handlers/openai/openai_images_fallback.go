@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	executorhelps "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -40,7 +42,58 @@ func (c *selectedAuthCapture) Get() string {
 }
 
 type imageFallbackService interface {
+	Execute(context.Context, string, imagesfallback.Request) (*imagesfallback.Result, error)
 	ExecuteWithAuthManager(context.Context, imagesfallback.Request, func(string)) (*imagesfallback.Result, error)
+}
+
+type routedImageAttempt struct {
+	payload      []byte
+	headers      http.Header
+	fallback     *imagesfallback.Result
+	usedFallback bool
+}
+
+type routedImageStreamAttempt struct {
+	data         <-chan []byte
+	errs         <-chan *interfaces.ErrorMessage
+	headers      http.Header
+	firstChunk   []byte
+	fallback     *imagesfallback.Result
+	usedFallback bool
+}
+
+type routedImageAttemptError struct {
+	statusCode int
+	err        error
+	headers    http.Header
+}
+
+func (e *routedImageAttemptError) Error() string {
+	if e == nil || e.err == nil {
+		return "image request failed"
+	}
+	return e.err.Error()
+}
+
+func (e *routedImageAttemptError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (e *routedImageAttemptError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.statusCode
+}
+
+func (e *routedImageAttemptError) Headers() http.Header {
+	if e == nil || e.headers == nil {
+		return nil
+	}
+	return e.headers.Clone()
 }
 
 var newImageFallbackService = func(cfg *sdkconfig.SDKConfig, authManager *coreauth.Manager) imageFallbackService {
@@ -169,12 +222,12 @@ func (h *OpenAIAPIHandler) collectRoutedImagesWithFallback(c *gin.Context, image
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	selectedAuth := &selectedAuthCapture{}
-	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, selectedAuth.Set)
+	primaryCtx := handlers.WithDisallowFreeAuth(cliCtx)
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	model := strings.TrimSpace(imageModel)
-	resp, upstreamHeaders, errMsg := h.ExecuteImageWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
+	resp, upstreamHeaders, errMsg := h.ExecuteImageWithAuthManager(primaryCtx, xaiImagesHandlerType, model, imageReq, "")
 	if errMsg != nil {
 		if h.shouldUseImageFallbackAfterRoutedError(errMsg) {
 			stopKeepAlive()
@@ -184,7 +237,7 @@ func (h *OpenAIAPIHandler) collectRoutedImagesWithFallback(c *gin.Context, image
 				"error":   errorString(errMsg),
 			}).Warn("openai images: routed image provider failed, switching to codex oauth fallback")
 			stopFallbackKeepAlive := startImageFallbackJSONKeepAlive(c, cliCtx)
-			fallbackOut, fallbackErr := h.executeImageFallbackAsJSON(cliCtx, selectedAuth.Set, responseFormat, fallbackReq)
+			attempt, fallbackErr := h.executeRoutedImageAttemptsAcrossCodexAuths(cliCtx, imageReq, model, fallbackReq, selectedAuth.Set)
 			stopFallbackKeepAlive()
 			if fallbackErr != nil {
 				h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, true)
@@ -201,8 +254,19 @@ func (h *OpenAIAPIHandler) collectRoutedImagesWithFallback(c *gin.Context, image
 				}
 				return
 			}
-			h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, false)
-			_, _ = c.Writer.Write(fallbackOut)
+			if attempt.usedFallback {
+				h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, false)
+				fallbackOut, buildErr := buildFallbackImagesAPIResponse(attempt.fallback, responseFormat)
+				if buildErr != nil {
+					h.WriteErrorResponse(c, buildErr)
+					cliCancel(buildErr.Error)
+					return
+				}
+				_, _ = c.Writer.Write(fallbackOut)
+			} else {
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), attempt.headers)
+				_, _ = c.Writer.Write(attempt.payload)
+			}
 			cliCancel(nil)
 			return
 		}
@@ -221,6 +285,73 @@ func (h *OpenAIAPIHandler) collectRoutedImagesWithFallback(c *gin.Context, image
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel(nil)
+}
+
+func (h *OpenAIAPIHandler) executeRoutedImageAttemptsAcrossCodexAuths(ctx context.Context, imageReq []byte, model string, fallbackReq imagesfallback.Request, selectedCallback func(string)) (*routedImageAttempt, *interfaces.ErrorMessage) {
+	if h == nil || h.AuthManager == nil {
+		return nil, &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: errors.New("auth manager is unavailable")}
+	}
+
+	metadata := map[string]any{
+		coreexecutor.RequestedModelMetadataKey:         model,
+		coreexecutor.SkipSelectedAuthResultMetadataKey: true,
+	}
+	if selectedCallback != nil {
+		metadata[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
+	}
+	service := newImageFallbackService(h.Cfg, h.AuthManager)
+	value, errExecute := h.AuthManager.ExecuteSelectedAuth(ctx, []string{"codex"}, imagesfallback.TextAuthSelectionModel, coreexecutor.Options{Metadata: metadata}, func(execCtx context.Context, auth *coreauth.Auth, _ string) (any, error) {
+		isOAuth := imagesfallback.IsCodexOAuthAuth(auth)
+		if !isOAuth || !imagesfallback.IsFreePlan(auth) {
+			primaryCtx := handlers.WithPinnedAuthID(handlers.WithDisallowFreeAuth(execCtx), auth.ID)
+			payload, headers, errMsg := h.ExecuteImageWithAuthManager(primaryCtx, xaiImagesHandlerType, model, imageReq, "")
+			if errMsg == nil {
+				return &routedImageAttempt{payload: payload, headers: headers}, nil
+			}
+			if !isOAuth || !h.shouldUseImageFallbackAfterRoutedError(errMsg) {
+				return nil, routedImageError(errMsg)
+			}
+			log.WithFields(log.Fields{
+				"auth_id": auth.ID,
+				"status":  errMsg.StatusCode,
+				"error":   errorString(errMsg),
+			}).Warn("openai images: selected codex primary path failed, trying web image fallback")
+		}
+
+		fallbackResult, errFallback := service.Execute(execCtx, auth.ID, fallbackReq)
+		if errFallback != nil {
+			return nil, errFallback
+		}
+		h.AuthManager.MarkResult(execCtx, coreauth.Result{AuthID: auth.ID, Provider: auth.Provider, Model: model, Success: true})
+		return &routedImageAttempt{fallback: fallbackResult, usedFallback: true}, nil
+	})
+	if errExecute != nil {
+		status := imagesfallback.StatusCode(errExecute)
+		if status <= 0 {
+			status = http.StatusBadGateway
+		}
+		var headers http.Header
+		if withHeaders, ok := errExecute.(interface{ Headers() http.Header }); ok && withHeaders != nil {
+			headers = withHeaders.Headers()
+		}
+		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: errExecute, Addon: headers}
+	}
+	attempt, ok := value.(*routedImageAttempt)
+	if !ok || attempt == nil {
+		return nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("image attempt returned an invalid result")}
+	}
+	return attempt, nil
+}
+
+func routedImageError(errMsg *interfaces.ErrorMessage) error {
+	if errMsg == nil {
+		return &routedImageAttemptError{statusCode: http.StatusBadGateway, err: errors.New("image request failed")}
+	}
+	err := errMsg.Error
+	if err == nil {
+		err = errors.New(http.StatusText(errMsg.StatusCode))
+	}
+	return &routedImageAttemptError{statusCode: errMsg.StatusCode, err: err, headers: errMsg.Addon}
 }
 
 func (h *OpenAIAPIHandler) collectImagesFromResponsesWithFallback(c *gin.Context, responsesReq []byte, responseFormat string, fallbackReq imagesfallback.Request) {
@@ -439,11 +570,11 @@ func (h *OpenAIAPIHandler) streamRoutedImagesWithFallback(c *gin.Context, imageR
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	selectedAuth := &selectedAuthCapture{}
-	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, selectedAuth.Set)
+	primaryCtx := handlers.WithDisallowFreeAuth(cliCtx)
 	model := strings.TrimSpace(imageModel)
 	execution, streamStarted, canceled := h.waitImagesStreamExecution(c, flusher, func() imagesStreamExecutionResult {
-		dataChan, upstreamHeaders, errChan := h.ExecuteImageStreamWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
+		dataChan, upstreamHeaders, errChan := h.ExecuteImageStreamWithAuthManager(primaryCtx, xaiImagesHandlerType, model, imageReq, "")
 		return imagesStreamExecutionResult{Data: dataChan, UpstreamHeaders: upstreamHeaders, Errs: errChan}
 	})
 	if canceled {
@@ -498,17 +629,29 @@ func (h *OpenAIAPIHandler) streamRoutedImagesWithFallback(c *gin.Context, imageR
 					"status":  errMsg.StatusCode,
 					"error":   errorString(errMsg),
 				}).Warn("openai images: routed image stream failed, switching to codex oauth fallback")
-				fallbackErr := h.writeImageFallbackStream(cliCtx, selectedAuth.Set, responseFormat, streamPrefix, fallbackReq, func() {
+				attempt, fallbackErr := h.executeRoutedImageStreamAttemptsAcrossCodexAuths(cliCtx, imageReq, model, fallbackReq, selectedAuth.Set)
+				if fallbackErr == nil && attempt.usedFallback {
+					h.writeImageFallbackResultStream(attempt.fallback, responseFormat, streamPrefix, func() {
+						setImagesSSEHeaders(c)
+					}, func(eventName string, dataJSON []byte) {
+						if strings.TrimSpace(eventName) != "" {
+							_, _ = c.Writer.Write([]byte("event: " + eventName + "\n"))
+						}
+						_, _ = c.Writer.Write([]byte("data: "))
+						_, _ = c.Writer.Write(dataJSON)
+						_, _ = c.Writer.Write([]byte("\n\n"))
+						flusher.Flush()
+					})
+				} else if fallbackErr == nil {
 					setImagesSSEHeaders(c)
-				}, func(eventName string, dataJSON []byte) {
-					if strings.TrimSpace(eventName) != "" {
-						_, _ = c.Writer.Write([]byte("event: " + eventName + "\n"))
+					handlers.WriteUpstreamHeaders(c.Writer.Header(), attempt.headers)
+					if len(attempt.firstChunk) > 0 {
+						_, _ = c.Writer.Write(attempt.firstChunk)
+						flusher.Flush()
 					}
-					_, _ = c.Writer.Write([]byte("data: "))
-					_, _ = c.Writer.Write(dataJSON)
-					_, _ = c.Writer.Write([]byte("\n\n"))
-					flusher.Flush()
-				})
+					h.forwardRawImageStream(cliCtx, c, func(err error) { cliCancel(err) }, attempt.data, attempt.errs)
+					return
+				}
 				if fallbackErr != nil {
 					h.publishImageFallbackFinalUsage(cliCtx, selectedAuth.Get(), fallbackReq.RequestedModel, true)
 					log.WithFields(log.Fields{
@@ -551,6 +694,84 @@ func (h *OpenAIAPIHandler) streamRoutedImagesWithFallback(c *gin.Context, imageR
 			streamStarted = true
 		}
 	}
+}
+
+func (h *OpenAIAPIHandler) executeRoutedImageStreamAttemptsAcrossCodexAuths(ctx context.Context, imageReq []byte, model string, fallbackReq imagesfallback.Request, selectedCallback func(string)) (*routedImageStreamAttempt, *interfaces.ErrorMessage) {
+	if h == nil || h.AuthManager == nil {
+		return nil, &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: errors.New("auth manager is unavailable")}
+	}
+
+	metadata := map[string]any{
+		coreexecutor.RequestedModelMetadataKey:         model,
+		coreexecutor.SkipSelectedAuthResultMetadataKey: true,
+	}
+	if selectedCallback != nil {
+		metadata[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
+	}
+	service := newImageFallbackService(h.Cfg, h.AuthManager)
+	value, errExecute := h.AuthManager.ExecuteSelectedAuth(ctx, []string{"codex"}, imagesfallback.TextAuthSelectionModel, coreexecutor.Options{Metadata: metadata}, func(execCtx context.Context, auth *coreauth.Auth, _ string) (any, error) {
+		isOAuth := imagesfallback.IsCodexOAuthAuth(auth)
+		if !isOAuth || !imagesfallback.IsFreePlan(auth) {
+			primaryCtx := handlers.WithPinnedAuthID(handlers.WithDisallowFreeAuth(execCtx), auth.ID)
+			data, headers, errs := h.ExecuteImageStreamWithAuthManager(primaryCtx, xaiImagesHandlerType, model, imageReq, "")
+			for data != nil || errs != nil {
+				select {
+				case <-execCtx.Done():
+					return nil, execCtx.Err()
+				case errMsg, okRead := <-errs:
+					if !okRead {
+						errs = nil
+						continue
+					}
+					if errMsg == nil {
+						continue
+					}
+					if !isOAuth || !h.shouldUseImageFallbackAfterRoutedError(errMsg) {
+						return nil, routedImageError(errMsg)
+					}
+					log.WithFields(log.Fields{
+						"auth_id": auth.ID,
+						"status":  errMsg.StatusCode,
+						"error":   errorString(errMsg),
+					}).Warn("openai images: selected codex primary stream failed, trying web image fallback")
+					data = nil
+					errs = nil
+				case chunk, okRead := <-data:
+					if !okRead {
+						data = nil
+						continue
+					}
+					return &routedImageStreamAttempt{data: data, errs: errs, headers: headers, firstChunk: chunk}, nil
+				}
+			}
+			if !isOAuth {
+				return nil, &routedImageAttemptError{statusCode: http.StatusBadGateway, err: io.ErrUnexpectedEOF, headers: headers}
+			}
+		}
+
+		fallbackResult, errFallback := service.Execute(execCtx, auth.ID, fallbackReq)
+		if errFallback != nil {
+			return nil, errFallback
+		}
+		h.AuthManager.MarkResult(execCtx, coreauth.Result{AuthID: auth.ID, Provider: auth.Provider, Model: model, Success: true})
+		return &routedImageStreamAttempt{fallback: fallbackResult, usedFallback: true}, nil
+	})
+	if errExecute != nil {
+		status := imagesfallback.StatusCode(errExecute)
+		if status <= 0 {
+			status = http.StatusBadGateway
+		}
+		var headers http.Header
+		if withHeaders, ok := errExecute.(interface{ Headers() http.Header }); ok && withHeaders != nil {
+			headers = withHeaders.Headers()
+		}
+		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: errExecute, Addon: headers}
+	}
+	attempt, ok := value.(*routedImageStreamAttempt)
+	if !ok || attempt == nil {
+		return nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("image stream attempt returned an invalid result")}
+	}
+	return attempt, nil
 }
 
 func (h *OpenAIAPIHandler) shouldUseImageFallback(errMsg *interfaces.ErrorMessage, authID string) bool {
@@ -630,7 +851,11 @@ func (h *OpenAIAPIHandler) writeImageFallbackStream(ctx context.Context, selecte
 	if errMsg != nil {
 		return errMsg
 	}
+	h.writeImageFallbackResultStream(result, responseFormat, streamPrefix, setSSEHeaders, writeEvent)
+	return nil
+}
 
+func (h *OpenAIAPIHandler) writeImageFallbackResultStream(result *imagesfallback.Result, responseFormat string, streamPrefix string, setSSEHeaders func(), writeEvent func(string, []byte)) {
 	setSSEHeaders()
 	eventName := streamPrefix + ".completed"
 	for _, image := range result.Images {
@@ -644,7 +869,6 @@ func (h *OpenAIAPIHandler) writeImageFallbackStream(ctx context.Context, selecte
 		}
 		writeEvent(eventName, payload)
 	}
-	return nil
 }
 
 func buildFallbackImagesAPIResponse(result *imagesfallback.Result, responseFormat string) ([]byte, *interfaces.ErrorMessage) {

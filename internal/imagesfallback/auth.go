@@ -10,6 +10,9 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
+// TextAuthSelectionModel keeps web-image fallback rotation tied to text credential health.
+const TextAuthSelectionModel = "gpt-5.4-mini"
+
 func IsCodexOAuthAuth(auth *coreauth.Auth) bool {
 	if auth == nil {
 		return false
@@ -41,7 +44,7 @@ func ResolveWebModel(auth *coreauth.Auth, requestedModel string) string {
 	case "gpt-image-1":
 		return "auto"
 	case "gpt-image-2":
-		if isFreePlan(auth) {
+		if IsFreePlan(auth) {
 			return "auto"
 		}
 		return "gpt-5-3"
@@ -83,7 +86,7 @@ func RefreshAccessTokenIfNeeded(ctx context.Context, manager *coreauth.Manager, 
 	return updated, nil
 }
 
-func isFreePlan(auth *coreauth.Auth) bool {
+func IsFreePlan(auth *coreauth.Auth) bool {
 	plan := normalizePlanType(extractPlanType(auth))
 	return plan == "" || plan == "free"
 }
