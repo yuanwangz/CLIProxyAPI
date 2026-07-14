@@ -349,6 +349,8 @@ func (m oauthTabModel) submitCallback(callbackURL string) tea.Cmd {
 			if p.name == m.providerName {
 				// Map provider name to the canonical key the API expects
 				switch p.apiPath {
+				case "gemini-cli-auth-url":
+					providerKey = "gemini"
 				case "anthropic-auth-url":
 					providerKey = "anthropic"
 				case "codex-auth-url":
