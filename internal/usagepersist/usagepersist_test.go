@@ -30,6 +30,7 @@ func TestBuildEventNormalizesUsageRecord(t *testing.T) {
 		Source:      "person@example.com",
 		RequestedAt: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC),
 		Latency:     1500 * time.Millisecond,
+		TTFT:        320 * time.Millisecond,
 		Detail: coreusage.Detail{
 			InputTokens:     10,
 			OutputTokens:    20,
@@ -71,8 +72,18 @@ func TestBuildEventNormalizesUsageRecord(t *testing.T) {
 	if event.LatencyMS == nil || *event.LatencyMS != 1500 {
 		t.Fatalf("latency = %v, want 1500ms", event.LatencyMS)
 	}
+	if event.TTFTMS == nil || *event.TTFTMS != 320 {
+		t.Fatalf("ttft = %v, want 320ms", event.TTFTMS)
+	}
 	if !json.Valid([]byte(event.RawJSON)) {
 		t.Fatalf("raw json is invalid: %s", event.RawJSON)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(event.RawJSON), &raw); err != nil {
+		t.Fatalf("unmarshal raw json: %v", err)
+	}
+	if raw["ttft_ms"] != float64(320) {
+		t.Fatalf("raw ttft_ms = %v, want 320", raw["ttft_ms"])
 	}
 }
 

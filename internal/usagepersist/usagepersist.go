@@ -82,6 +82,7 @@ type Event struct {
 	CacheTokens     int64  `json:"cache_tokens"`
 	TotalTokens     int64  `json:"total_tokens"`
 	LatencyMS       *int64 `json:"latency_ms,omitempty"`
+	TTFTMS          *int64 `json:"ttft_ms,omitempty"`
 	Failed          bool   `json:"failed"`
 	StatusCode      int    `json:"status_code,omitempty"`
 	Error           string `json:"error,omitempty"`
@@ -110,6 +111,7 @@ type Detail struct {
 	APIKeyHash string `json:"api_key_hash,omitempty"`
 	AuthIndex  string `json:"auth_index,omitempty"`
 	LatencyMS  *int64 `json:"latency_ms,omitempty"`
+	TTFTMS     *int64 `json:"ttft_ms,omitempty"`
 	StatusCode int    `json:"status_code,omitempty"`
 	Error      string `json:"error,omitempty"`
 	Tokens     Tokens `json:"tokens"`
@@ -311,6 +313,7 @@ func (s *Store) init() error {
 			cache_tokens integer not null default 0,
 			total_tokens integer not null default 0,
 			latency_ms integer,
+			ttft_ms integer,
 			failed integer not null default 0,
 			status_code integer not null default 0,
 			raw_json text,
@@ -367,6 +370,7 @@ func (s *Store) ensureUsageEventColumns() error {
 		"source_full": `alter table usage_events add column source_full text`,
 		"api_key":     `alter table usage_events add column api_key text`,
 		"status_code": `alter table usage_events add column status_code integer not null default 0`,
+		"ttft_ms":     `alter table usage_events add column ttft_ms integer`,
 	}
 	rows, err := s.db.Query(`pragma table_info(usage_events)`)
 	if err != nil {
@@ -582,6 +586,11 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 	if latency > 0 {
 		latencyPtr = &latency
 	}
+	ttft := record.TTFT.Milliseconds()
+	var ttftPtr *int64
+	if ttft > 0 {
+		ttftPtr = &ttft
+	}
 
 	failed := record.Failed
 	statusCode := usageStatusCode(ctx, record)
@@ -614,6 +623,7 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 		CacheTokens:     tokens.CacheTokens,
 		TotalTokens:     tokens.TotalTokens,
 		LatencyMS:       latencyPtr,
+		TTFTMS:          ttftPtr,
 		Failed:          failed,
 		StatusCode:      statusCode,
 		Error:           failureBody(record.Fail.Body, failed),
@@ -650,9 +660,9 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 	stmt, err := tx.PrepareContext(ctx, `insert or ignore into usage_events (
 		request_id, event_hash, timestamp_ms, timestamp, provider, model, endpoint, method, path,
 		auth_type, auth_index, source, source_full, source_hash, api_key, api_key_hash, input_tokens, output_tokens,
-		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, status_code, raw_json,
+		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, ttft_ms, failed, status_code, raw_json,
 		created_at_ms
-	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return result, err
 	}
@@ -684,6 +694,7 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 			event.CacheTokens,
 			event.TotalTokens,
 			nullInt64(event.LatencyMS),
+			nullInt64(event.TTFTMS),
 			boolToInt(event.Failed),
 			event.StatusCode,
 			event.RawJSON,
@@ -729,7 +740,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 		coalesce(endpoint, ''), coalesce(method, ''), coalesce(path, ''),
 		coalesce(auth_type, ''), coalesce(auth_index, ''), coalesce(source, ''), coalesce(source_full, ''),
 		coalesce(source_hash, ''), coalesce(api_key, ''), coalesce(api_key_hash, ''), input_tokens, output_tokens,
-		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, failed, status_code, coalesce(raw_json, ''),
+		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, ttft_ms, failed, status_code, coalesce(raw_json, ''),
 		created_at_ms
 		from usage_events order by timestamp_ms desc, id desc limit ?`, limit)
 	if err != nil {
@@ -741,6 +752,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 	for rows.Next() {
 		var event Event
 		var latency sql.NullInt64
+		var ttft sql.NullInt64
 		var failed int
 		if err := rows.Scan(
 			&event.RequestID,
@@ -766,6 +778,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 			&event.CacheTokens,
 			&event.TotalTokens,
 			&latency,
+			&ttft,
 			&failed,
 			&event.StatusCode,
 			&event.RawJSON,
@@ -776,6 +789,10 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 		if latency.Valid {
 			value := latency.Int64
 			event.LatencyMS = &value
+		}
+		if ttft.Valid {
+			value := ttft.Int64
+			event.TTFTMS = &value
 		}
 		event.Failed = failed != 0
 		event.Error = failureBodyFromRawJSON(event.RawJSON)
@@ -1557,6 +1574,7 @@ func BuildPayload(events []Event) Payload {
 			APIKeyHash: event.APIKeyHash,
 			AuthIndex:  event.AuthIndex,
 			LatencyMS:  event.LatencyMS,
+			TTFTMS:     event.TTFTMS,
 			StatusCode: event.StatusCode,
 			Error:      errorDetail,
 			Failed:     event.Failed,
@@ -1884,6 +1902,7 @@ func rawEventJSON(event Event, alias string) string {
 		"cache_tokens":     event.CacheTokens,
 		"total_tokens":     event.TotalTokens,
 		"latency_ms":       event.LatencyMS,
+		"ttft_ms":          event.TTFTMS,
 		"failed":           event.Failed,
 		"status_code":      event.StatusCode,
 	}
