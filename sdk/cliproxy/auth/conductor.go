@@ -1428,10 +1428,32 @@ func (m *Manager) resolveExecutionAliasResult(auth *Auth, routeModel string) OAu
 }
 
 func (m *Manager) resolveExecutionAliasResultForRequested(auth *Auth, requestedModel string) OAuthModelAliasResult {
+	if result := homeForceMappingAliasResult(auth, requestedModel); result.ForceMapping {
+		return result
+	}
 	if auth != nil && auth.AuthKind() == AuthKindAPIKey {
 		return m.resolveAPIKeyModelAliasWithResult(auth, requestedModel)
 	}
 	return m.applyOAuthModelAliasWithResult(auth, requestedModel)
+}
+
+func homeForceMappingAliasResult(auth *Auth, requestedModel string) OAuthModelAliasResult {
+	if auth == nil || auth.Attributes == nil || !strings.EqualFold(strings.TrimSpace(auth.Attributes[homeForceMappingAttributeKey]), "true") {
+		return OAuthModelAliasResult{}
+	}
+	originalAlias := strings.TrimSpace(auth.Attributes[homeOriginalAliasAttributeKey])
+	if originalAlias == "" {
+		return OAuthModelAliasResult{}
+	}
+	upstreamModel := strings.TrimSpace(auth.Attributes[homeUpstreamModelAttributeKey])
+	if upstreamModel == "" {
+		upstreamModel = strings.TrimSpace(requestedModel)
+	}
+	return OAuthModelAliasResult{
+		UpstreamModel: upstreamModel,
+		ForceMapping:  true,
+		OriginalAlias: originalAlias,
+	}
 }
 
 func executionAliasPoolModel(auth *Auth, requestedModel string, aliasResult OAuthModelAliasResult) string {
@@ -1943,10 +1965,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
-				rerr := &Error{Message: chunk.Err.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := resultErrorFromError(chunk.Err)
 				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
 			}
 			if !forward {
@@ -2043,10 +2062,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 		}
 		if errStream != nil {
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := resultErrorFromError(errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
@@ -2083,10 +2099,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		if bootstrapErr != nil {
 			if isRequestInvalidError(bootstrapErr) {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := resultErrorFromError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -2095,10 +2108,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := resultErrorFromError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -2107,10 +2117,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				lastErr = bootstrapErr
 				continue
 			}
-			rerr := &Error{Message: bootstrapErr.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := resultErrorFromError(bootstrapErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
@@ -2763,10 +2770,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: &Error{Message: errPrepare.Error()}}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && se != nil {
-				result.Error.HTTPStatus = se.StatusCode()
-			}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
 			continue
@@ -2800,10 +2804,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
+				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -2883,10 +2884,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: &Error{Message: errPrepare.Error()}}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && se != nil {
-				result.Error.HTTPStatus = se.StatusCode()
-			}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
 			continue
@@ -2920,10 +2918,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
+				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -3000,10 +2995,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: &Error{Message: errPrepare.Error()}}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && se != nil {
-				result.Error.HTTPStatus = se.StatusCode()
-			}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
 			continue
@@ -3217,6 +3209,9 @@ func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.O
 	if serviceTier != "" {
 		ctx = coreusage.WithServiceTier(ctx, serviceTier)
 	}
+	if generate, ok := generateFromOptions(opts); ok {
+		ctx = coreusage.WithGenerate(ctx, generate)
+	}
 	return ctx
 }
 
@@ -3264,10 +3259,30 @@ func reasoningEffortFromOptions(opts cliproxyexecutor.Options) string {
 }
 
 func serviceTierFromOptions(opts cliproxyexecutor.Options) string {
+	return stringMetadataValue(opts.Metadata, cliproxyexecutor.ServiceTierMetadataKey)
+}
+
+func generateFromOptions(opts cliproxyexecutor.Options) (bool, bool) {
 	if len(opts.Metadata) == 0 {
+		return false, false
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.GenerateMetadataKey]
+	if !ok || raw == nil {
+		return false, false
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value, true
+	default:
+		return false, false
+	}
+}
+
+func stringMetadataValue(metadata map[string]any, key string) string {
+	if len(metadata) == 0 {
 		return ""
 	}
-	raw, ok := opts.Metadata[cliproxyexecutor.ServiceTierMetadataKey]
+	raw, ok := metadata[key]
 	if !ok || raw == nil {
 		return ""
 	}
@@ -3921,7 +3936,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				if !isRequestScopedNotFoundResultError(result.Error) {
+				if !isRequestScopedResultError(result.Error) {
 					disableCooling := m.cooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
 					state.Unavailable = true
@@ -4437,6 +4452,28 @@ func statusCodeFromError(err error) int {
 	return 0
 }
 
+func isRequestScopedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	requestErr, ok := errors.AsType[cliproxyexecutor.RequestScopedError](err)
+	return ok && requestErr != nil && requestErr.IsRequestScoped()
+}
+
+func resultErrorFromError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	resultErr := &Error{
+		Message:    err.Error(),
+		HTTPStatus: statusCodeFromError(err),
+	}
+	if isRequestScopedError(err) || isRequestInvalidError(err) {
+		resultErr.Code = requestScopedErrorCode
+	}
+	return resultErr
+}
+
 func isUnauthorizedError(err error) bool {
 	if err == nil {
 		return false
@@ -4623,6 +4660,10 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 	return isRequestScopedNotFoundMessage(err.Message)
 }
 
+func isRequestScopedResultError(err *Error) bool {
+	return err != nil && (err.IsRequestScoped() || isRequestScopedNotFoundResultError(err))
+}
+
 // isRequestInvalidError returns true if the error represents a client request
 // error that should not be retried. Specifically, it treats 400 responses with
 // "invalid_request_error", request-scoped 404 item misses caused by `store=false`,
@@ -4632,6 +4673,9 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if isRequestScopedError(err) {
+		return true
 	}
 	if isCloudflareChallengeError(err) {
 		return false
@@ -4647,6 +4691,7 @@ func isRequestInvalidError(err error) bool {
 	case http.StatusBadRequest:
 		msg := err.Error()
 		return strings.Contains(msg, "invalid_request_error") ||
+			strings.Contains(msg, "bad_request_error") ||
 			strings.Contains(msg, "INVALID_ARGUMENT") ||
 			strings.Contains(msg, "FAILED_PRECONDITION")
 	case http.StatusNotFound:
@@ -4666,7 +4711,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	if auth == nil {
 		return
 	}
-	if isRequestScopedNotFoundResultError(resultErr) {
+	if isRequestScopedResultError(resultErr) {
 		return
 	}
 	auth.Unavailable = true
@@ -4996,6 +5041,46 @@ func (m *Manager) SelectAuth(ctx context.Context, provider, model string, opts c
 	return selected, nil
 }
 
+// SelectAuthByKind selects one credential of the required kind through the
+// configured scheduling strategy. Credentials of other kinds are skipped.
+func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, requiredKind string, opts cliproxyexecutor.Options) (*Auth, error) {
+	requiredKind = normalizeAuthKind(requiredKind)
+	if requiredKind == "" {
+		return nil, &Error{Code: "invalid_auth_kind", Message: "required auth kind is invalid", HTTPStatus: http.StatusBadRequest}
+	}
+
+	homeMode := m.HomeEnabled()
+	homeAuthCount := homeAuthCountFromMetadata(opts.Metadata)
+	tried := make(map[string]struct{})
+	for {
+		pickOpts := opts
+		if homeMode {
+			pickOpts = withHomeAuthCount(opts, homeAuthCount)
+		}
+		selected, _, errPick := m.pickNext(ctx, provider, model, pickOpts, tried)
+		if errPick != nil {
+			return nil, errPick
+		}
+		if selected == nil {
+			return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if selected.AuthKind() == requiredKind {
+			return selected, nil
+		}
+		authID := strings.TrimSpace(selected.ID)
+		if authID == "" {
+			return nil, &Error{Code: "auth_not_found", Message: "selected auth has no ID"}
+		}
+		if _, alreadyTried := tried[authID]; alreadyTried {
+			return nil, &Error{Code: "auth_not_found", Message: "selector repeatedly returned an ineligible auth"}
+		}
+		tried[authID] = struct{}{}
+		if homeMode {
+			homeAuthCount++
+		}
+	}
+}
+
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
@@ -5262,6 +5347,8 @@ type homeErrorDetail struct {
 
 const (
 	homeUpstreamModelAttributeKey     = "home_upstream_model"
+	homeForceMappingAttributeKey      = "home_force_mapping"
+	homeOriginalAliasAttributeKey     = "home_original_alias"
 	homeRequestRetryExceededErrorCode = "request_retry_exceeded"
 )
 
@@ -5301,11 +5388,13 @@ func repeatedHomeAuthError() *Error {
 }
 
 type homeAuthDispatchResponse struct {
-	Model      string `json:"model"`
-	Provider   string `json:"provider"`
-	AuthIndex  string `json:"auth_index"`
-	UserAPIKey string `json:"user_api_key"`
-	Auth       Auth   `json:"auth"`
+	Model         string `json:"model"`
+	Provider      string `json:"provider"`
+	AuthIndex     string `json:"auth_index"`
+	UserAPIKey    string `json:"user_api_key"`
+	ForceMapping  bool   `json:"force_mapping"`
+	OriginalAlias string `json:"original_alias"`
+	Auth          Auth   `json:"auth"`
 }
 
 type homeAuthDispatcher interface {
@@ -5567,9 +5656,16 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	}
 	if upstreamModel := strings.TrimSpace(dispatch.Model); upstreamModel != "" {
 		if auth.Attributes == nil {
-			auth.Attributes = make(map[string]string, 1)
+			auth.Attributes = make(map[string]string, 3)
 		}
 		auth.Attributes[homeUpstreamModelAttributeKey] = upstreamModel
+	}
+	if originalAlias := strings.TrimSpace(dispatch.OriginalAlias); dispatch.ForceMapping && originalAlias != "" {
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string, 2)
+		}
+		auth.Attributes[homeForceMappingAttributeKey] = "true"
+		auth.Attributes[homeOriginalAliasAttributeKey] = originalAlias
 	}
 	if strings.TrimSpace(auth.ID) == "" {
 		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned auth without id", HTTPStatus: http.StatusBadGateway}
@@ -5769,10 +5865,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
+				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}

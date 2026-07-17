@@ -778,22 +778,9 @@ func (s *Service) configureCooldownStateStore(cfg *config.Config) {
 	// This fork persists cooldown state in usage.sqlite via internal/usagepersist with
 	// asynchronous incremental writes; keep the upstream file-backed .cds store disabled
 	// so the two mechanisms do not double-restore or double-persist the same state.
+	// Upstream's SaveCooldownStatus/.cds path stays merged for mergeability but is not enabled.
+	_ = cfg
 	s.coreManager.SetCooldownStateStore(nil)
-	if cfg == nil || !cfg.SaveCooldownStatus || cfg.Home.Enabled {
-		s.coreManager.SetCooldownStateStore(nil)
-		return
-	}
-	authDir, errResolve := resolveCooldownStateAuthDir(cfg)
-	if errResolve != nil {
-		log.Warnf("failed to resolve cooldown state directory: %v", errResolve)
-		s.coreManager.SetCooldownStateStore(nil)
-		return
-	}
-	if authDir == "" {
-		s.coreManager.SetCooldownStateStore(nil)
-		return
-	}
-	s.coreManager.SetCooldownStateStore(coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir))
 }
 
 func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {
