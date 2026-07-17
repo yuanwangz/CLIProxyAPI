@@ -3918,6 +3918,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 		if result.Success && (auth.Disabled || auth.Status == StatusDisabled) {
 			auth.UpdatedAt = now
+			// Successful uses break consecutive failure progress even while disabled.
+			_ = ClearConsecutiveStatusFailures(auth)
 		} else if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
@@ -3934,6 +3936,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
+			// Any success clears consecutive status-disable progress (and durable key via Sync).
+			_ = ClearConsecutiveStatusFailures(auth)
 		} else {
 			if result.Model != "" {
 				if !isRequestScopedResultError(result.Error) {
@@ -3953,11 +3957,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 					}
 					if isModelSupportResultError(result.Error) {
+						_ = ClearConsecutiveStatusFailures(auth)
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
 					} else if isCloudflareChallengeResultError(result.Error) {
+						// CF 403 is not a policy forbidden; clear consecutive progress.
+						_ = ClearConsecutiveStatusFailures(auth)
 						next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
 						state.NextRetryAfter = next
 						state.StatusMessage = "cloudflare challenge"
@@ -3971,6 +3978,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							BackoffLevel:  backoffLevel,
 						}
 					} else if isInvalidGrantResultError(result.Error) {
+						_ = ClearConsecutiveStatusFailures(auth)
 						if disableCooling {
 							state.NextRetryAfter = time.Time{}
 						} else {
@@ -3981,6 +3989,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					} else {
 						switch statusCode {
 						case 401:
+							_ = ClearConsecutiveStatusFailures(auth)
 							state.NextRetryAfter = time.Time{}
 							state.Quota = QuotaState{}
 							if !preserveUnauthorized {
@@ -3988,7 +3997,26 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							}
 							clearModelQuota = true
 						case 402, 403:
-							if disableCooling {
+							disabledByConsecutive := false
+							if statusCode == http.StatusForbidden {
+								if findConsecutiveStatusDisablePolicy(auth.Provider, statusCode) != nil {
+									disabledByConsecutive = tryApplyConsecutiveStatusDisable(auth, result.Error, now)
+								} else {
+									// Non-policy 403 (other providers) breaks any leftover streak.
+									_ = ClearConsecutiveStatusFailures(auth)
+								}
+							} else {
+								_ = ClearConsecutiveStatusFailures(auth)
+							}
+							if disabledByConsecutive {
+								state.NextRetryAfter = time.Time{}
+								state.Quota = QuotaState{}
+								if result.Error != nil {
+									state.LastError = cloneError(result.Error)
+									state.StatusMessage = firstNonEmptyAuthStateString(auth.StatusMessage, result.Error.Message, "forbidden")
+								}
+								clearModelQuota = true
+							} else if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(30 * time.Minute)
@@ -3997,6 +4025,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 404:
+							_ = ClearConsecutiveStatusFailures(auth)
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
@@ -4006,6 +4035,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 429:
+							_ = ClearConsecutiveStatusFailures(auth)
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
@@ -4028,12 +4058,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								setModelQuota = true
 							}
 						case 408, 500, 502, 503, 504:
+							_ = ClearConsecutiveStatusFailures(auth)
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								state.NextRetryAfter = nextTransientErrorRetryAfter(now)
 							}
 						default:
+							_ = ClearConsecutiveStatusFailures(auth)
 							state.NextRetryAfter = time.Time{}
 						}
 					}
@@ -4725,6 +4757,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	statusCode := statusCodeFromResult(resultErr)
 	if isCloudflareChallengeResultError(resultErr) {
+		_ = ClearConsecutiveStatusFailures(auth)
 		auth.StatusMessage = "cloudflare challenge"
 		next, backoffLevel := nextCloudflareCooldown(auth.Quota.BackoffLevel, disableCooling, now)
 		auth.Quota = QuotaState{
@@ -4737,6 +4770,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		return
 	}
 	if isInvalidGrantResultError(resultErr) {
+		_ = ClearConsecutiveStatusFailures(auth)
 		auth.StatusMessage = "invalid_grant"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
@@ -4747,8 +4781,20 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	switch statusCode {
 	case 401:
+		_ = ClearConsecutiveStatusFailures(auth)
 		applyUnauthorizedDisabledState(auth, resultErr, now)
 	case 402, 403:
+		if statusCode == http.StatusForbidden {
+			if findConsecutiveStatusDisablePolicy(auth.Provider, statusCode) != nil {
+				if tryApplyConsecutiveStatusDisable(auth, resultErr, now) {
+					return
+				}
+			} else {
+				_ = ClearConsecutiveStatusFailures(auth)
+			}
+		} else {
+			_ = ClearConsecutiveStatusFailures(auth)
+		}
 		auth.StatusMessage = "payment_required"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
@@ -4756,6 +4802,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
 		}
 	case 404:
+		_ = ClearConsecutiveStatusFailures(auth)
 		auth.StatusMessage = "not_found"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
@@ -4763,6 +4810,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = now.Add(12 * time.Hour)
 		}
 	case 429:
+		_ = ClearConsecutiveStatusFailures(auth)
 		auth.StatusMessage = "quota exhausted"
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
@@ -4777,6 +4825,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
+		_ = ClearConsecutiveStatusFailures(auth)
 		auth.StatusMessage = "transient upstream error"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
@@ -4784,6 +4833,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = nextTransientErrorRetryAfter(now)
 		}
 	default:
+		_ = ClearConsecutiveStatusFailures(auth)
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
 		}

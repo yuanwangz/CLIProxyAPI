@@ -98,6 +98,10 @@ type Auth struct {
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
 
+	// consecutiveStatusFailures tracks consecutive HTTP status failures for
+	// disable policies (e.g. xAI 403 x3). Mirrored into metadata for durability.
+	consecutiveStatusFailures map[int]int `json:"-"`
+
 	recentRequests recentRequestRing `json:"-"`
 	indexAssigned  bool              `json:"-"`
 }
@@ -284,6 +288,7 @@ func (a *Auth) Clone() *Auth {
 			copyAuth.ModelStates[key] = state.Clone()
 		}
 	}
+	copyAuth.consecutiveStatusFailures = cloneConsecutiveStatusFailures(a.consecutiveStatusFailures)
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
 }

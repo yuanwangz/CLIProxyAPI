@@ -50,9 +50,15 @@ func SyncAuthStateToMetadata(auth *Auth) {
 	}
 	auth.Metadata[metadataArchivedKey] = auth.Archived
 	auth.Metadata[metadataDisabledKey] = auth.Disabled
+	syncConsecutiveStatusFailuresToMetadata(auth)
 	persistLastError := auth.Disabled || auth.Status == StatusDisabled
-	if persistLastError && auth.LastError != nil && auth.LastError.HTTPStatus == 401 {
-		auth.StatusMessage = firstNonEmptyAuthStateString(auth.StatusMessage, "unauthorized")
+	if persistLastError && auth.LastError != nil {
+		switch auth.LastError.HTTPStatus {
+		case 401:
+			auth.StatusMessage = firstNonEmptyAuthStateString(auth.StatusMessage, "unauthorized")
+		case 403:
+			auth.StatusMessage = firstNonEmptyAuthStateString(auth.StatusMessage, "forbidden")
+		}
 	}
 	if persistLastError && auth.LastError != nil {
 		lastErrorMetadata := authErrorToMetadata(auth.LastError)
@@ -93,6 +99,9 @@ func RestoreAuthStateFromMetadata(auth *Auth) {
 			auth.Status = StatusDisabled
 		}
 	}
+	// Restore consecutive failure progress for healthy and disabled auths alike so
+	// a restart after 1–2 matching failures does not reset the disable threshold.
+	restoreConsecutiveStatusFailuresFromMetadata(auth)
 	if !auth.Disabled && auth.Status != StatusDisabled {
 		return
 	}
@@ -103,11 +112,21 @@ func RestoreAuthStateFromMetadata(auth *Auth) {
 	if lastError == nil {
 		return
 	}
-	if lastError.HTTPStatus == 401 && strings.TrimSpace(lastError.Code) == "" {
-		lastError.Code = "unauthorized"
-	}
-	if lastError.HTTPStatus == 401 && strings.TrimSpace(lastError.Message) == "" {
-		lastError.Message = "unauthorized"
+	switch lastError.HTTPStatus {
+	case 401:
+		if strings.TrimSpace(lastError.Code) == "" {
+			lastError.Code = "unauthorized"
+		}
+		if strings.TrimSpace(lastError.Message) == "" {
+			lastError.Message = "unauthorized"
+		}
+	case 403:
+		if strings.TrimSpace(lastError.Code) == "" {
+			lastError.Code = "forbidden"
+		}
+		if strings.TrimSpace(lastError.Message) == "" {
+			lastError.Message = "forbidden"
+		}
 	}
 	auth.LastError = lastError
 	if strings.TrimSpace(auth.StatusMessage) == "" {
@@ -115,8 +134,13 @@ func RestoreAuthStateFromMetadata(auth *Auth) {
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		auth.Status = StatusDisabled
-		if lastError.HTTPStatus == 401 && strings.TrimSpace(auth.StatusMessage) == "" {
-			auth.StatusMessage = "unauthorized"
+		if strings.TrimSpace(auth.StatusMessage) == "" {
+			switch lastError.HTTPStatus {
+			case 401:
+				auth.StatusMessage = "unauthorized"
+			case 403:
+				auth.StatusMessage = "forbidden"
+			}
 		}
 	}
 }

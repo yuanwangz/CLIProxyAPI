@@ -1561,18 +1561,24 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 	if disabled {
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "disabled via management API"
-	} else if auth.Archived {
-		auth.Status = coreauth.StatusArchived
-		auth.StatusMessage = ""
 	} else {
-		auth.Status = coreauth.StatusActive
-		auth.StatusMessage = ""
+		// Operator re-enable clears consecutive status-disable progress so a
+		// previously half-counted streak cannot immediately re-disable.
+		_ = coreauth.ClearConsecutiveStatusFailures(auth)
+		if auth.Archived {
+			auth.Status = coreauth.StatusArchived
+			auth.StatusMessage = ""
+		} else {
+			auth.Status = coreauth.StatusActive
+			auth.StatusMessage = ""
+		}
 	}
 	auth.UpdatedAt = time.Now()
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
 	auth.Metadata["disabled"] = disabled
+	coreauth.SyncAuthStateToMetadata(auth)
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.
