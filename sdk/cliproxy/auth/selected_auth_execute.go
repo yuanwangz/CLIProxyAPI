@@ -91,7 +91,7 @@ func (m *Manager) executeSelectedAuthOnce(ctx context.Context, providers []strin
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		publishSelectedAuthMetadata(opts.Metadata, auth)
 
 		tried[auth.ID] = struct{}{}
 		attempted[auth.ID] = struct{}{}
