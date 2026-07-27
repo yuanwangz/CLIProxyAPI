@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,6 +83,77 @@ func TestExtractAccessToken(t *testing.T) {
 			got := extractAccessToken(tt.metadata)
 			if got != tt.expected {
 				t.Errorf("extractAccessToken() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestFileTokenStoreSaveExistingMetadataSetsFileAttributes(t *testing.T) {
+	tests := []struct {
+		name          string
+		existingToken string
+		savedToken    string
+	}{
+		{name: "unchanged content", existingToken: "token", savedToken: "token"},
+		{name: "overwritten content", existingToken: "old-token", savedToken: "new-token"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			baseDir := t.TempDir()
+			fileName := "antigravity-user.json"
+			path := filepath.Join(baseDir, fileName)
+			existing := []byte(`{"type":"antigravity","access_token":"` + tt.existingToken + `","disabled":false}`)
+			if errWrite := os.WriteFile(path, existing, 0o600); errWrite != nil {
+				t.Fatalf("write existing auth file: %v", errWrite)
+			}
+
+			store := NewFileTokenStore()
+			store.SetBaseDir(baseDir)
+			auth := &cliproxyauth.Auth{
+				ID:       fileName,
+				FileName: fileName,
+				Metadata: map[string]any{
+					"type":         "antigravity",
+					"access_token": tt.savedToken,
+				},
+			}
+
+			savedPath, errSave := store.Save(context.Background(), auth)
+			if errSave != nil {
+				t.Fatalf("Save() error = %v", errSave)
+			}
+			if savedPath != path {
+				t.Fatalf("Save() path = %q, want %q", savedPath, path)
+			}
+			if got := auth.Attributes[cliproxyauth.AttributePath]; got != path {
+				t.Errorf("path attribute = %q, want %q", got, path)
+			}
+			if got := auth.Attributes[cliproxyauth.AttributeSource]; got != path {
+				t.Errorf("source attribute = %q, want %q", got, path)
+			}
+			if got := auth.Attributes[cliproxyauth.AttributeSourceBackend]; got != cliproxyauth.AuthSourceFile {
+				t.Errorf("source backend attribute = %q, want %q", got, cliproxyauth.AuthSourceFile)
+			}
+			persisted, errRead := os.ReadFile(path)
+			if errRead != nil {
+				t.Fatalf("read saved auth file: %v", errRead)
+			}
+			var persistedMetadata map[string]any
+			if errUnmarshal := json.Unmarshal(persisted, &persistedMetadata); errUnmarshal != nil {
+				t.Fatalf("unmarshal saved auth file: %v", errUnmarshal)
+			}
+			if createdAt, _ := persistedMetadata["credential_created_at"].(string); createdAt == "" {
+				t.Fatal("saved auth file missing credential creation timestamp")
+			}
+			delete(persistedMetadata, "credential_created_at")
+			normalized, errMarshal := json.Marshal(persistedMetadata)
+			if errMarshal != nil {
+				t.Fatalf("marshal normalized saved auth file: %v", errMarshal)
+			}
+			expected := []byte(`{"type":"antigravity","access_token":"` + tt.savedToken + `","disabled":false,"archived":false}`)
+			if !jsonEqual(normalized, expected) {
+				t.Errorf("saved auth file = %s, want JSON equal to %s", normalized, expected)
 			}
 		})
 	}
