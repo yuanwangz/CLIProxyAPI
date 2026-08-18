@@ -271,6 +271,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var terminateErr error
 
 		defer close(out)
+		defer reporter.EnsurePublished(ctx)
 		defer func() {
 			if sess != nil {
 				sess.clearActive(conn, readCh)

@@ -184,6 +184,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			out = helps.EnsureResponsesUsageDetails(out)
 		}
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+		reporter.EnsurePublished(ctx)
 		return resp, nil
 	}
 	if errRead != nil {

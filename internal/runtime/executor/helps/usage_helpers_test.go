@@ -689,6 +689,26 @@ func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	}
 }
 
+func TestUsageReporterEnsurePublishedRecordsSuccessfulRequestWithoutUsage(t *testing.T) {
+	plugin := &captureUsagePlugin{ch: make(chan usage.Record, 1)}
+	usage.RegisterPlugin(plugin)
+
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.4", nil)
+	reporter.EnsurePublished(context.Background())
+
+	select {
+	case record := <-plugin.ch:
+		if record.Failed {
+			t.Fatal("failed = true, want false")
+		}
+		if record.Provider != "codex" || record.Model != "gpt-5.4" {
+			t.Fatalf("record identity = provider=%q model=%q", record.Provider, record.Model)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for usage record")
+	}
+}
+
 func TestFailFromErrorsMapsContextStatuses(t *testing.T) {
 	tests := []struct {
 		name string

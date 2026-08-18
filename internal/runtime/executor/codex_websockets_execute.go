@@ -333,6 +333,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				out = helps.EnsureResponsesUsageDetails(out)
 			}
 			resp = cliproxyexecutor.Response{Payload: out}
+			reporter.EnsurePublished(ctx)
 			return resp, nil
 		}
 	}
