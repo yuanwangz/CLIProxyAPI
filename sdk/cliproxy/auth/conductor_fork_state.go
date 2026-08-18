@@ -173,6 +173,13 @@ func errorIsUnauthorized(err *Error) bool {
 	return err != nil && err.StatusCode() == http.StatusUnauthorized
 }
 
+func isDurableUnauthorizedResultError(err *Error) bool {
+	if err == nil || err.StatusCode() != http.StatusUnauthorized {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(err.Code), "unauthorized") || strings.EqualFold(strings.TrimSpace(err.Message), "unauthorized")
+}
+
 func statusMessageIsQuotaCooldown(message string) bool { return quotaTextIndicatesCooldown(message) }
 
 func quotaTextIndicatesCooldown(value string) bool {

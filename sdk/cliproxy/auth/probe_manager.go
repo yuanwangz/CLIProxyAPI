@@ -32,6 +32,7 @@ func (m *Manager) CloneForProbe() *Manager {
 	m.mu.RUnlock()
 
 	clone := NewManager(nil, selector, NoopHook{})
+	clone.probeMode = true
 	clone.SetRoundTripperProvider(rtProvider)
 	clone.requestRetry.Store(m.requestRetry.Load())
 	clone.maxRetryCredentials.Store(m.maxRetryCredentials.Load())
