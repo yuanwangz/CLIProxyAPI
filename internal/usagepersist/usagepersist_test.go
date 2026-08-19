@@ -21,16 +21,17 @@ func TestBuildEventNormalizesUsageRecord(t *testing.T) {
 	internallogging.SetResponseStatus(ctx, http.StatusInternalServerError)
 
 	event := BuildEvent(ctx, coreusage.Record{
-		Provider:    "openai",
-		Model:       "gpt-5",
-		Alias:       "client-gpt",
-		APIKey:      "sk-test-1234567890abcdefghijklmnopqrstuvwxyz",
-		AuthType:    "oauth",
-		AuthIndex:   "account-1",
-		Source:      "person@example.com",
-		RequestedAt: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC),
-		Latency:     1500 * time.Millisecond,
-		TTFT:        320 * time.Millisecond,
+		Provider:        "openai",
+		Model:           "gpt-5",
+		ReasoningEffort: " high ",
+		Alias:           "client-gpt",
+		APIKey:          "sk-test-1234567890abcdefghijklmnopqrstuvwxyz",
+		AuthType:        "oauth",
+		AuthIndex:       "account-1",
+		Source:          "person@example.com",
+		RequestedAt:     time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC),
+		Latency:         1500 * time.Millisecond,
+		TTFT:            320 * time.Millisecond,
 		Detail: coreusage.Detail{
 			InputTokens:     10,
 			OutputTokens:    20,
@@ -75,6 +76,9 @@ func TestBuildEventNormalizesUsageRecord(t *testing.T) {
 	if event.TTFTMS == nil || *event.TTFTMS != 320 {
 		t.Fatalf("ttft = %v, want 320ms", event.TTFTMS)
 	}
+	if event.ReasoningEffort != "high" {
+		t.Fatalf("reasoning effort = %q, want high", event.ReasoningEffort)
+	}
 	if !json.Valid([]byte(event.RawJSON)) {
 		t.Fatalf("raw json is invalid: %s", event.RawJSON)
 	}
@@ -84,6 +88,9 @@ func TestBuildEventNormalizesUsageRecord(t *testing.T) {
 	}
 	if raw["ttft_ms"] != float64(320) {
 		t.Fatalf("raw ttft_ms = %v, want 320", raw["ttft_ms"])
+	}
+	if raw["reasoning_effort"] != "high" {
+		t.Fatalf("raw reasoning_effort = %v, want high", raw["reasoning_effort"])
 	}
 }
 
@@ -177,19 +184,20 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 			LatencyMS:    &latency,
 		},
 		{
-			RequestID:    "req-2",
-			Timestamp:    "2026-01-02T03:05:05Z",
-			Endpoint:     "POST /v1/chat/completions",
-			Model:        "gpt-5",
-			Source:       "local",
-			SourceFull:   "local-full",
-			APIKey:       "client-key-123456",
-			APIKeyHash:   "client-key-hash",
-			OutputTokens: 4,
-			TotalTokens:  4,
-			Failed:       true,
-			StatusCode:   http.StatusTooManyRequests,
-			Error:        `{"error":{"message":"rate limit reached"}}`,
+			RequestID:       "req-2",
+			Timestamp:       "2026-01-02T03:05:05Z",
+			Endpoint:        "POST /v1/chat/completions",
+			Model:           "gpt-5",
+			ReasoningEffort: "medium",
+			Source:          "local",
+			SourceFull:      "local-full",
+			APIKey:          "client-key-123456",
+			APIKeyHash:      "client-key-hash",
+			OutputTokens:    4,
+			TotalTokens:     4,
+			Failed:          true,
+			StatusCode:      http.StatusTooManyRequests,
+			Error:           `{"error":{"message":"rate limit reached"}}`,
 		},
 	})
 	if err != nil {
@@ -238,6 +246,9 @@ func TestStoreAggregatesAndExportsEvents(t *testing.T) {
 	detail := apiEntry.Models["gpt-5"].Details[0]
 	if detail.SourceFull != "local-full" || detail.APIKey != "clie...3456" || detail.APIKeyHash != "client-key-hash" || detail.StatusCode != http.StatusTooManyRequests || detail.Error != `{"error":{"message":"rate limit reached"}}` {
 		t.Fatalf("payload detail did not preserve extended fields: %+v", detail)
+	}
+	if detail.ReasoningEffort != "medium" {
+		t.Fatalf("payload reasoning effort = %q, want medium", detail.ReasoningEffort)
 	}
 
 	exported, err := store.ExportJSONL(ctx)

@@ -65,6 +65,7 @@ type Event struct {
 	Timestamp       string `json:"timestamp"`
 	Provider        string `json:"provider,omitempty"`
 	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	Endpoint        string `json:"endpoint,omitempty"`
 	Method          string `json:"method,omitempty"`
 	Path            string `json:"path,omitempty"`
@@ -102,20 +103,21 @@ type Tokens struct {
 }
 
 type Detail struct {
-	Timestamp  string `json:"timestamp"`
-	Provider   string `json:"provider,omitempty"`
-	Source     string `json:"source"`
-	SourceFull string `json:"source_full,omitempty"`
-	SourceHash string `json:"source_hash,omitempty"`
-	APIKey     string `json:"api_key,omitempty"`
-	APIKeyHash string `json:"api_key_hash,omitempty"`
-	AuthIndex  string `json:"auth_index,omitempty"`
-	LatencyMS  *int64 `json:"latency_ms,omitempty"`
-	TTFTMS     *int64 `json:"ttft_ms,omitempty"`
-	StatusCode int    `json:"status_code,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Tokens     Tokens `json:"tokens"`
-	Failed     bool   `json:"failed"`
+	Timestamp       string `json:"timestamp"`
+	Provider        string `json:"provider,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	Source          string `json:"source"`
+	SourceFull      string `json:"source_full,omitempty"`
+	SourceHash      string `json:"source_hash,omitempty"`
+	APIKey          string `json:"api_key,omitempty"`
+	APIKeyHash      string `json:"api_key_hash,omitempty"`
+	AuthIndex       string `json:"auth_index,omitempty"`
+	LatencyMS       *int64 `json:"latency_ms,omitempty"`
+	TTFTMS          *int64 `json:"ttft_ms,omitempty"`
+	StatusCode      int    `json:"status_code,omitempty"`
+	Error           string `json:"error,omitempty"`
+	Tokens          Tokens `json:"tokens"`
+	Failed          bool   `json:"failed"`
 }
 
 type QuotaSnapshot struct {
@@ -296,6 +298,7 @@ func (s *Store) init() error {
 			timestamp text not null,
 			provider text,
 			model text not null,
+			reasoning_effort text,
 			endpoint text,
 			method text,
 			path text,
@@ -367,10 +370,11 @@ func (s *Store) init() error {
 
 func (s *Store) ensureUsageEventColumns() error {
 	columns := map[string]string{
-		"source_full": `alter table usage_events add column source_full text`,
-		"api_key":     `alter table usage_events add column api_key text`,
-		"status_code": `alter table usage_events add column status_code integer not null default 0`,
-		"ttft_ms":     `alter table usage_events add column ttft_ms integer`,
+		"source_full":      `alter table usage_events add column source_full text`,
+		"api_key":          `alter table usage_events add column api_key text`,
+		"reasoning_effort": `alter table usage_events add column reasoning_effort text`,
+		"status_code":      `alter table usage_events add column status_code integer not null default 0`,
+		"ttft_ms":          `alter table usage_events add column ttft_ms integer`,
 	}
 	rows, err := s.db.Query(`pragma table_info(usage_events)`)
 	if err != nil {
@@ -606,6 +610,7 @@ func BuildEvent(ctx context.Context, record coreusage.Record) Event {
 		Timestamp:       timestamp.Format(time.RFC3339Nano),
 		Provider:        provider,
 		Model:           model,
+		ReasoningEffort: strings.TrimSpace(record.ReasoningEffort),
 		Endpoint:        endpoint,
 		Method:          method,
 		Path:            path,
@@ -658,11 +663,11 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 		_ = tx.Rollback()
 	}()
 	stmt, err := tx.PrepareContext(ctx, `insert or ignore into usage_events (
-		request_id, event_hash, timestamp_ms, timestamp, provider, model, endpoint, method, path,
+		request_id, event_hash, timestamp_ms, timestamp, provider, model, reasoning_effort, endpoint, method, path,
 		auth_type, auth_index, source, source_full, source_hash, api_key, api_key_hash, input_tokens, output_tokens,
 		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, ttft_ms, failed, status_code, raw_json,
 		created_at_ms
-	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return result, err
 	}
@@ -677,6 +682,7 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) (ImportResult,
 			event.Timestamp,
 			event.Provider,
 			event.Model,
+			event.ReasoningEffort,
 			event.Endpoint,
 			event.Method,
 			event.Path,
@@ -737,7 +743,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 	}
 	rows, err := s.db.QueryContext(ctx, `select
 		coalesce(request_id, ''), event_hash, timestamp_ms, timestamp, coalesce(provider, ''), model,
-		coalesce(endpoint, ''), coalesce(method, ''), coalesce(path, ''),
+		coalesce(reasoning_effort, ''), coalesce(endpoint, ''), coalesce(method, ''), coalesce(path, ''),
 		coalesce(auth_type, ''), coalesce(auth_index, ''), coalesce(source, ''), coalesce(source_full, ''),
 		coalesce(source_hash, ''), coalesce(api_key, ''), coalesce(api_key_hash, ''), input_tokens, output_tokens,
 		reasoning_tokens, cached_tokens, cache_tokens, total_tokens, latency_ms, ttft_ms, failed, status_code, coalesce(raw_json, ''),
@@ -761,6 +767,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 			&event.Timestamp,
 			&event.Provider,
 			&event.Model,
+			&event.ReasoningEffort,
 			&event.Endpoint,
 			&event.Method,
 			&event.Path,
@@ -1565,19 +1572,20 @@ func BuildPayload(events []Event) Payload {
 			errorDetail = failureBodyFromRawJSON(event.RawJSON)
 		}
 		modelEntry.Details = append(modelEntry.Details, Detail{
-			Timestamp:  event.Timestamp,
-			Provider:   event.Provider,
-			Source:     event.Source,
-			SourceFull: event.SourceFull,
-			SourceHash: event.SourceHash,
-			APIKey:     event.APIKey,
-			APIKeyHash: event.APIKeyHash,
-			AuthIndex:  event.AuthIndex,
-			LatencyMS:  event.LatencyMS,
-			TTFTMS:     event.TTFTMS,
-			StatusCode: event.StatusCode,
-			Error:      errorDetail,
-			Failed:     event.Failed,
+			Timestamp:       event.Timestamp,
+			Provider:        event.Provider,
+			ReasoningEffort: event.ReasoningEffort,
+			Source:          event.Source,
+			SourceFull:      event.SourceFull,
+			SourceHash:      event.SourceHash,
+			APIKey:          event.APIKey,
+			APIKeyHash:      event.APIKeyHash,
+			AuthIndex:       event.AuthIndex,
+			LatencyMS:       event.LatencyMS,
+			TTFTMS:          event.TTFTMS,
+			StatusCode:      event.StatusCode,
+			Error:           errorDetail,
+			Failed:          event.Failed,
 			Tokens: Tokens{
 				InputTokens:     event.InputTokens,
 				OutputTokens:    event.OutputTokens,
@@ -1750,6 +1758,7 @@ func normalizeEvent(event Event) Event {
 	if strings.TrimSpace(event.Model) == "" {
 		event.Model = "-"
 	}
+	event.ReasoningEffort = strings.TrimSpace(event.ReasoningEffort)
 	if strings.TrimSpace(event.Endpoint) == "" {
 		event.Endpoint = "-"
 	}
@@ -1884,6 +1893,7 @@ func rawEventJSON(event Event, alias string) string {
 		"timestamp":        event.Timestamp,
 		"provider":         event.Provider,
 		"model":            event.Model,
+		"reasoning_effort": strings.TrimSpace(event.ReasoningEffort),
 		"alias":            strings.TrimSpace(alias),
 		"endpoint":         event.Endpoint,
 		"method":           event.Method,
@@ -1974,6 +1984,7 @@ func buildEventHash(event Event) string {
 		event.Timestamp,
 		event.Endpoint,
 		event.Model,
+		event.ReasoningEffort,
 		event.AuthIndex,
 		event.SourceHash,
 		strconv.FormatInt(event.InputTokens, 10),
